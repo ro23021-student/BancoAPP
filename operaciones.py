@@ -38,7 +38,9 @@ def _get_cliente(session, cid):
     return session.query(Cliente).filter_by(id=cid).first()
 
 def _mov(session, cliente_id, tipo, monto, desc):
+    from models import _gen_num_trx
     session.add(Movimiento(
+        num_trx=_gen_num_trx(),
         cliente_id=cliente_id,
         tipo=tipo,
         monto=money(monto),
@@ -54,12 +56,13 @@ def _set_saldo(session, cid, saldo):
 def calcular_cuota(monto, tasa_anual, meses):
     """
     Calcula la cuota mensual con amortización francesa (interés compuesto).
-    Disponible para uso en vistas/exportaciones.
-    Nota: otorgar_prestamo usa interés simple (cuota = (capital + interés) / meses)
-    para mayor simplicidad operativa.
+    Si la tasa es 0, retorna simplemente capital / meses.
     """
-
+    if meses <= 0:
+        raise ValueError("El plazo debe ser mayor a cero")
     tasa = Decimal(str(tasa_anual)) / Decimal("12")
+    if tasa == 0:
+        return money(Decimal(str(monto)) / Decimal(str(meses)))
 
     cuota = (
         monto *
@@ -76,7 +79,9 @@ def calcular_cuota(monto, tasa_anual, meses):
 def crear_cliente(session, nombre, tipo, saldo_inicial,
                    documento=None, tipo_documento="DUI",
                    telefono=None, email=None,
-                   direccion=None, fecha_nacimiento=None):
+                   direccion=None, fecha_nacimiento=None,
+                   nit=None, profesion=None, ingresos_mensuales=0,
+                   tipo_cuenta_id=None, sucursal_id=None):
     nombre = nombre.strip().title()
     if not nombre:
         return False, "Nombre inválido"
@@ -91,9 +96,16 @@ def crear_cliente(session, nombre, tipo, saldo_inicial,
         if dup:
             return False, f"Ya existe un cliente con ese documento ({documento})"
 
+    if email:
+        email = email.strip()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            return False, "El formato del email no es válido"
+
     cliente = Cliente(
         nombre=nombre,
         tipo=tipo,
+        tipo_cuenta_id=tipo_cuenta_id,
+        sucursal_id=sucursal_id,
         saldo=Decimal("0.00"),
         documento=documento or None,
         tipo_documento=tipo_documento,
@@ -101,6 +113,10 @@ def crear_cliente(session, nombre, tipo, saldo_inicial,
         email=email.strip().lower() if email else None,
         direccion=direccion.strip() if direccion else None,
         fecha_nacimiento=fecha_nacimiento or None,
+        nit=nit or None,
+        profesion=profesion.strip() if profesion else None,
+        ingresos_mensuales=Decimal(str(ingresos_mensuales)) if ingresos_mensuales else Decimal("0"),
+        kyc_completo=bool(documento and nit),
         estado="ACTIVO",
     )
     session.add(cliente)
@@ -160,6 +176,8 @@ def editar_cliente(session, cliente_id, **kwargs):
                 return False, "Ese documento ya está registrado en otra cuenta"
         if campo == "email" and valor:
             valor = valor.lower()
+            if "@" not in valor or "." not in valor.split("@")[-1]:
+                return False, "El formato del email no es válido"
         setattr(cliente, campo, valor)
 
     cliente.actualizado_en = _dt.utcnow()
@@ -421,6 +439,8 @@ def otorgar_prestamo(session, cliente_id, monto, plazo_meses):
         return False, "El monto debe ser mayor a cero"
     if monto < 100:
         return False, "El monto mínimo de préstamo es $100"
+    if not isinstance(plazo_meses, int) or plazo_meses <= 0:
+        return False, "El plazo debe ser un número entero mayor a cero"
 
     # Verificar que el banco tiene respaldo patrimonial suficiente
     # (el préstamo crea dinero pero debe estar respaldado por el capital del banco)
@@ -701,8 +721,10 @@ def revertir_operacion(session, movimiento_id, motivo=""):
                        f"{VENTANA_REVERSION_MIN} minutos.")
 
     # Verificar que no haya sido revertido ya
-    ya_revertido = session.query(Movimiento).filter_by(
-        descripcion=f"REVERSO mov#{movimiento_id}"
+    ya_revertido = session.query(Movimiento).filter(
+        Movimiento.tipo == "Reverso",
+        Movimiento.descripcion.like(f"REVERSO mov#{movimiento_id}%"),
+        Movimiento.cliente_id == mov.cliente_id,
     ).first()
     if ya_revertido:
         return False, "Esta operación ya fue revertida anteriormente."

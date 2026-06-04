@@ -22,6 +22,21 @@ from models import (
     BaseLocal, Cliente, Movimiento, Prestamo,
     CuentaContable, Asiento, LineaAsiento, ConfigBanco,
     Usuario, AuditLog,
+    TipoCuenta, Beneficiario, DepositoPlazoFijo, Garantia,
+    ScoreCredito, TarjetaDebito, TarjetaCredito,
+    Sucursal, ATM, AlertaAML, CierreDiario,
+    Socio, AporteSocio, CuotaPrestamo,
+)
+from extras import (
+    inicializar_tipos_cuenta, inicializar_sucursales,
+    agregar_beneficiario, eliminar_beneficiario,
+    crear_deposito_plazo, vencer_deposito_plazo,
+    agregar_garantia, refinanciar_prestamo,
+    calcular_score, emitir_tarjeta_debito, emitir_tarjeta_credito,
+    verificar_aml, obtener_alertas_aml, revisar_alerta_aml,
+    realizar_cierre_diario, generar_balance_general, generar_estado_resultados,
+    registrar_socio, registrar_aporte, historial_cliente,
+    actualizar_cuotas_vencidas,
 )
 from contabilidad import (
     inicializar_contabilidad, saldo_cuenta, caja_real,
@@ -374,6 +389,42 @@ def vista_panel(session):
             )
             st.plotly_chart(fig2, use_container_width=True)
 
+    # ── Fila 2: alertas AML, score, sucursales ──
+    st.divider()
+    col_aml, col_score, col_suc, col_dpf = st.columns(4)
+
+    aml_pendientes = session.query(func.count(AlertaAML.id)).filter_by(estado="PENDIENTE").scalar() or 0
+    with col_aml:
+        color_aml = "#e74c3c" if aml_pendientes > 0 else "#2ecc71"
+        st.markdown(f"<div style='background:#1e1e2e;border:1px solid #3d3b3c;border-radius:8px;padding:12px;text-align:center'>"
+                    f"<div style='color:#8a8694;font-size:.75rem'>Alertas AML</div>"
+                    f"<div style='font-size:1.6rem;font-weight:700;color:{color_aml}'>{aml_pendientes}</div>"
+                    f"<div style='color:#8a8694;font-size:.72rem'>pendientes</div></div>", unsafe_allow_html=True)
+
+    score_prom = session.query(func.avg(Cliente.score_credito)).filter(Cliente.estado=="ACTIVO").scalar()
+    score_prom = round(float(score_prom), 0) if score_prom else 500
+    score_c = "#2ecc71" if score_prom >= 650 else "#f39c12" if score_prom >= 500 else "#e74c3c"
+    with col_score:
+        st.markdown(f"<div style='background:#1e1e2e;border:1px solid #3d3b3c;border-radius:8px;padding:12px;text-align:center'>"
+                    f"<div style='color:#8a8694;font-size:.75rem'>Score promedio</div>"
+                    f"<div style='font-size:1.6rem;font-weight:700;color:{score_c}'>{int(score_prom)}</div>"
+                    f"<div style='color:#8a8694;font-size:.72rem'>cartera</div></div>", unsafe_allow_html=True)
+
+    num_sucursales = session.query(func.count(Sucursal.id)).filter_by(activa=True).scalar() or 0
+    with col_suc:
+        st.markdown(f"<div style='background:#1e1e2e;border:1px solid #3d3b3c;border-radius:8px;padding:12px;text-align:center'>"
+                    f"<div style='color:#8a8694;font-size:.75rem'>Sucursales activas</div>"
+                    f"<div style='font-size:1.6rem;font-weight:700;color:#7ec8c8'>{num_sucursales}</div>"
+                    f"<div style='color:#8a8694;font-size:.72rem'>en operación</div></div>", unsafe_allow_html=True)
+
+    num_dpf = session.query(func.count(DepositoPlazoFijo.id)).filter_by(estado="ACTIVO").scalar() or 0
+    with col_dpf:
+        st.markdown(f"<div style='background:#1e1e2e;border:1px solid #3d3b3c;border-radius:8px;padding:12px;text-align:center'>"
+                    f"<div style='color:#8a8694;font-size:.75rem'>Plazos fijos activos</div>"
+                    f"<div style='font-size:1.6rem;font-weight:700;color:#a89cc8'>{num_dpf}</div>"
+                    f"<div style='color:#8a8694;font-size:.72rem'>certificados</div></div>", unsafe_allow_html=True)
+
+    st.divider()
     st.markdown("#### Últimos 10 movimientos")
     ultimos = (
         session.query(Movimiento)
@@ -442,28 +493,44 @@ def vista_clientes(session, usuario):
     # ── Tab 2: Nuevo cliente ──────────────────────────────────
     if "➕ Nuevo cliente" in tab_map:
         with tab_map["➕ Nuevo cliente"]:
+            tipos_cuenta = session.query(TipoCuenta).filter_by(activo=True).order_by(TipoCuenta.nombre).all()
+            sucursales   = session.query(Sucursal).filter_by(activa=True).order_by(Sucursal.nombre).all()
+
             with st.form("nuevo_cliente", clear_on_submit=True):
-                st.markdown("**Datos de identificación**")
+                st.markdown("**📋 Datos de identificación (KYC)**")
                 col1, col2 = st.columns(2)
                 with col1:
-                    nombre = st.text_input("Nombre completo *")
-                    tipo   = st.selectbox("Tipo de cuenta", ["ahorro", "corriente"])
-                    saldo_inicial = st.number_input(
-                        "Saldo inicial ($)", min_value=0.0, step=100.0, max_value=500_000.0,
-                        help="El banco no cobra comisión al abrir la cuenta."
-                    )
+                    nombre        = st.text_input("Nombre completo *")
+                    tipo_doc      = st.selectbox("Tipo documento", ["DUI", "Pasaporte", "NIT", "Carnet residente"])
+                    documento     = st.text_input("Número de documento (DUI)")
+                    nit_input     = st.text_input("NIT")
                 with col2:
-                    tipo_doc  = st.selectbox("Tipo documento", ["DUI", "Pasaporte", "NIT", "Carnet residente"])
-                    documento = st.text_input("Número de documento")
-                    fecha_nac = st.text_input("Fecha de nacimiento (YYYY-MM-DD)")
+                    tc_nombres    = [t.nombre for t in tipos_cuenta]
+                    tc_idx        = st.selectbox("Tipo de cuenta *", range(len(tc_nombres)),
+                                                  format_func=lambda i: tc_nombres[i])
+                    saldo_inicial = st.number_input("Saldo inicial ($)", min_value=0.0, step=100.0, max_value=500_000.0)
+                    fecha_nac     = st.text_input("Fecha de nacimiento (YYYY-MM-DD)")
+                    suc_nombres   = [s.nombre for s in sucursales]
+                    suc_idx       = st.selectbox("Sucursal", range(len(suc_nombres)),
+                                                  format_func=lambda i: suc_nombres[i]) if suc_nombres else None
 
-                st.markdown("**Datos de contacto**")
+                st.markdown("**👤 Datos económicos (KYC)**")
                 col3, col4 = st.columns(2)
                 with col3:
-                    telefono  = st.text_input("Teléfono")
-                    email     = st.text_input("Correo electrónico")
+                    profesion     = st.text_input("Profesión / Ocupación")
+                    ingresos      = st.number_input("Ingresos mensuales ($)", min_value=0.0, step=50.0)
                 with col4:
-                    direccion = st.text_area("Dirección", height=80)
+                    telefono      = st.text_input("Teléfono")
+                    email         = st.text_input("Correo electrónico")
+
+                direccion = st.text_area("Dirección", height=70)
+
+                # Mostrar info del tipo de cuenta seleccionado
+                if tipos_cuenta:
+                    tc_sel = tipos_cuenta[tc_idx]
+                    st.info(f"ℹ️ **{tc_sel.nombre}** — Tasa: {float(tc_sel.tasa_interes)*100:.2f}% anual | "
+                            f"Saldo mínimo: ${float(tc_sel.saldo_minimo):,.2f} | "
+                            f"Comisión: {'Sí' if tc_sel.cobra_comision else 'No'}")
 
                 enviado = st.form_submit_button("✅ Crear cliente", type="primary")
 
@@ -471,15 +538,21 @@ def vista_clientes(session, usuario):
                 if not nombre.strip():
                     alert("error", "✗ El nombre no puede estar vacío.")
                 else:
+                    tc_id  = tipos_cuenta[tc_idx].id if tipos_cuenta else None
+                    tc_nom = tipos_cuenta[tc_idx].nombre if tipos_cuenta else "Ahorro"
+                    suc_id = sucursales[suc_idx].id if sucursales and suc_idx is not None else None
                     ok, msg = crear_cliente(
-                        session, nombre, tipo, saldo_inicial,
+                        session, nombre, tc_nom, saldo_inicial,
                         documento=documento, tipo_documento=tipo_doc,
-                    telefono=telefono, email=email,
-                    direccion=direccion, fecha_nacimiento=fecha_nac,
-                )
-                alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
-                if ok:
-                    st.rerun()
+                        telefono=telefono, email=email,
+                        direccion=direccion, fecha_nacimiento=fecha_nac,
+                        nit=nit_input, profesion=profesion,
+                        ingresos_mensuales=ingresos,
+                        tipo_cuenta_id=tc_id, sucursal_id=suc_id,
+                    )
+                    alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
+                    if ok:
+                        st.rerun()
 
     # ── Tab 3: Editar cliente ─────────────────────────────────
     if "✏️ Editar" in tab_map:
@@ -600,7 +673,7 @@ def vista_clientes(session, usuario):
                     else:  # CERRADO
                         alert("info", "Esta cuenta está cerrada. No se pueden realizar más operaciones.")
 
-    # ── Tab 5: Historial ──────────────────────────────────────
+    # ── Tab 5: Historial completo (expediente bancario) ──────
     with tab_map["📜 Historial"]:
         clientes_h = session.query(Cliente).order_by(Cliente.nombre).all()
         if clientes_h:
@@ -610,27 +683,137 @@ def vista_clientes(session, usuario):
                 format_func=lambda c: f"[{c.num_cuenta}] {c.nombre}  —  ${c.saldo:,.2f}",
                 key="hist_sel",
             )
-            movs = (
-                session.query(Movimiento)
-                .filter_by(cliente_id=sel.id)
-                .order_by(Movimiento.fecha.desc())
-                .all()
-            )
-            col_a, col_b = st.columns([2, 1])
-            with col_a:
-                st.markdown(f"**Movimientos de {sel.nombre}**")
-                st.caption(f"Cuenta: `{sel.num_cuenta}` · Estado: {sel.estado}")
-            with col_b:
-                color = "#10B981" if sel.saldo >= 0 else "#F87171"
-                st.markdown(
-                    f"<div style='text-align:right;font-family:DM Mono,monospace;"
-                    f"font-size:1.1rem;font-weight:600;color:{color}'>"
-                    f"${sel.saldo:,.2f}</div>",
-                    unsafe_allow_html=True,
-                )
-            render_movimientos(movs)
-            st.divider()
-            _botones_exportar_historial(session, sel, movs)
+            exp = historial_cliente(session, sel.id)
+            if not exp:
+                alert("error", "No se pudo cargar el historial.")
+            else:
+                # ── Resumen de cuenta ──
+                kyc_icon = "✅" if sel.kyc_completo else "⚠️"
+                score_color = "#2ecc71" if sel.score_credito >= 650 else "#f39c12" if sel.score_credito >= 500 else "#e74c3c"
+                st.markdown(f"""
+<div style="background:#1e1e2e;border:1px solid #3d3b3c;border-radius:10px;padding:16px;margin-bottom:12px">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start">
+    <div>
+      <div style="font-size:1.1rem;font-weight:700;color:#e8e4d9">{sel.nombre}</div>
+      <div style="color:#8a8694;font-size:.82rem">Cuenta: <code>{sel.num_cuenta}</code> · Tipo: {sel.tipo} · {kyc_icon} KYC</div>
+      <div style="color:#8a8694;font-size:.82rem">DUI: {sel.documento or "—"} · NIT: {sel.nit or "—"} · Tel: {sel.telefono or "—"}</div>
+      <div style="color:#8a8694;font-size:.82rem">Profesión: {sel.profesion or "—"} · Ingresos: ${float(sel.ingresos_mensuales or 0):,.2f}/mes</div>
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:1.4rem;font-weight:700;color:#7ec8c8">${float(sel.saldo):,.2f}</div>
+      <div style="font-size:.82rem;color:{score_color}">Score: {sel.score_credito or 500}</div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+                # ── Score crediticio ──
+                score_tab, movs_tab, prest_tab, tarj_tab, dpf_tab, benef_tab = st.tabs([
+                    "📊 Score", "💳 Movimientos", "🏷️ Préstamos",
+                    "💳 Tarjetas", "📑 Plazo Fijo", "⭐ Beneficiarios"
+                ])
+
+                with score_tab:
+                    sc = exp.get("score")
+                    col_s1, col_s2 = st.columns([1, 2])
+                    with col_s1:
+                        if st.button("🔄 Recalcular Score", key=f"score_btn_{sel.id}"):
+                            sc = calcular_score(session, sel.id)
+                            session.commit()
+                            st.rerun()
+                    if sc:
+                        score_val = sc.score
+                        cat_color = {"Excelente": "#2ecc71", "Bueno": "#27ae60",
+                                     "Regular": "#f39c12", "Malo": "#e67e22", "Muy Malo": "#e74c3c"}
+                        color_sc = cat_color.get(sc.categoria, "#8a8694")
+                        st.markdown(f"""
+<div style="background:#1e1e2e;border:2px solid {color_sc};border-radius:12px;padding:20px;text-align:center">
+  <div style="font-size:3rem;font-weight:900;color:{color_sc}">{score_val}</div>
+  <div style="font-size:1.1rem;color:{color_sc};font-weight:600">{sc.categoria}</div>
+  <div style="color:#8a8694;font-size:.82rem;margin-top:8px">
+    Pagos puntuales: {sc.pagos_puntuales} · Pagos atrasados: {sc.pagos_atrasados} ·
+    Préstamos activos: {sc.prestamos_activos}
+  </div>
+</div>""", unsafe_allow_html=True)
+                    else:
+                        st.info("Presiona 'Recalcular Score' para generar el score crediticio.")
+
+                with movs_tab:
+                    movs = exp["movimientos"]
+                    col_a, col_b = st.columns([2, 1])
+                    with col_a:
+                        st.markdown(f"**{len(movs)} movimiento(s)**")
+                    with col_b:
+                        color = "#10B981" if sel.saldo >= 0 else "#F87171"
+                        st.markdown(f"<div style='text-align:right;font-family:DM Mono,monospace;font-size:1.1rem;font-weight:600;color:{color}'>${float(sel.saldo):,.2f}</div>", unsafe_allow_html=True)
+                    render_movimientos(movs)
+                    st.divider()
+                    _botones_exportar_historial(session, sel, movs)
+
+                with prest_tab:
+                    prest_list = exp["prestamos"]
+                    if prest_list:
+                        for p in prest_list:
+                            estado_c = "#2ecc71" if p.estado == "ACTIVO" else "#8a8694"
+                            st.markdown(f"""
+<div style="background:#1e1e2e;border-left:4px solid {estado_c};padding:10px 14px;border-radius:6px;margin-bottom:8px">
+  <b>Préstamo #{p.id}</b> — ${float(p.monto):,.2f} | Saldo: ${float(p.saldo_pendiente):,.2f}
+  | Estado: <span style="color:{estado_c}">{p.estado}</span>
+  | Mora: ${float(p.mora_acumulada or 0):,.2f} | Clasificación: {p.clasificacion or "—"}
+</div>""", unsafe_allow_html=True)
+                    else:
+                        st.info("No tiene préstamos registrados.")
+
+                with tarj_tab:
+                    td = exp["tarjetas_debito"]
+                    tc = exp["tarjetas_credito"]
+                    if td:
+                        st.markdown("**Tarjetas de Débito**")
+                        for t in td:
+                            st.markdown(f"🟦 `****{t.numero[-4:]}` · Vence: {t.vencimiento} · Estado: {t.estado}")
+                    if tc:
+                        st.markdown("**Tarjetas de Crédito**")
+                        for t in tc:
+                            st.markdown(f"🟨 `****{t.numero[-4:]}` · Límite: ${float(t.limite):,.2f} · Usado: ${float(t.saldo_usado):,.2f} · Estado: {t.estado}")
+                    if not td and not tc:
+                        st.info("No tiene tarjetas emitidas.")
+
+                with dpf_tab:
+                    dpfs = exp["depositos_plazo"]
+                    if dpfs:
+                        for d in dpfs:
+                            st.markdown(f"📑 **{d.num_certificado}** — ${float(d.monto):,.2f} · {d.plazo_meses} meses · {float(d.tasa_anual)*100:.1f}% · Vence: {d.fecha_vencimiento} · **{d.estado}**")
+                    else:
+                        st.info("No tiene depósitos a plazo fijo.")
+
+                with benef_tab:
+                    benefs = exp["beneficiarios"]
+                    if benefs:
+                        for b in benefs:
+                            col_b1, col_b2 = st.columns([3, 1])
+                            with col_b1:
+                                st.markdown(f"⭐ **{b.alias}** — Cuenta: `{b.cuenta_destino}` ({b.nombre_destino or '—'})")
+                            with col_b2:
+                                if st.button("🗑️", key=f"del_benef_{b.id}"):
+                                    eliminar_beneficiario(session, b.id, sel.id)
+                                    session.commit()
+                                    st.rerun()
+                    else:
+                        st.info("No tiene beneficiarios registrados.")
+                    st.divider()
+                    st.markdown("**➕ Agregar beneficiario**")
+                    col_ba, col_bb = st.columns(2)
+                    with col_ba:
+                        nueva_cuenta = st.text_input("Número de cuenta destino", key=f"benef_cuenta_{sel.id}")
+                    with col_bb:
+                        nuevo_alias  = st.text_input("Alias", key=f"benef_alias_{sel.id}")
+                    if st.button("Agregar", key=f"btn_benef_{sel.id}"):
+                        ok, result = agregar_beneficiario(session, sel.id, nueva_cuenta, nuevo_alias)
+                        if ok:
+                            session.commit()
+                            st.success("✅ Beneficiario agregado")
+                            st.rerun()
+                        else:
+                            st.error(result)
         else:
             alert("info", "No hay clientes registrados.")
 
@@ -720,6 +903,11 @@ def vista_operaciones(session):
             audit(session, usuario_activo, "DEPOSITO",
                   f"Cliente {sel.nombre} ({sel.num_cuenta}) — ${monto:,.2f}",
                   "OK" if ok else "ERROR")
+            if ok:
+                aml_alerts = verificar_aml(session, sel.id, monto, "Deposito")
+                session.commit()
+                if aml_alerts:
+                    st.warning(f"🚨 AML: Se generó {len(aml_alerts)} alerta(s) de prevención de lavado de dinero.")
             alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
             if ok: st.rerun()
 
@@ -755,14 +943,38 @@ def vista_operaciones(session):
     # ── Transferencia ──
     elif "Transferencia" in operacion:
         st.markdown("**Transferencia entre cuentas** — comisión del 1% a cargo del origen.")
+
+        # Selector de origen primero para cargar beneficiarios
+        origen_sel = st.selectbox("Cuenta origen", clientes,
+                                  format_func=lambda c: f"[{c.num_cuenta}] {c.nombre}  —  ${c.saldo:,.2f}",
+                                  key="trf_origen_pre")
+
+        # Beneficiarios frecuentes del cliente origen
+        benefs = session.query(Beneficiario).filter_by(cliente_id=origen_sel.id, activo=True).all()
+        destino_manual = True
+        if benefs:
+            st.caption(f"⭐ Este cliente tiene {len(benefs)} beneficiario(s) frecuente(s)")
+            usar_benef = st.checkbox("Usar beneficiario frecuente", key="trf_usar_benef")
+            if usar_benef:
+                benef_sel = st.selectbox("Beneficiario", benefs,
+                                         format_func=lambda b: f"{b.alias} — {b.cuenta_destino}",
+                                         key="trf_benef_sel")
+                destino_cliente = session.query(Cliente).filter_by(num_cuenta=benef_sel.cuenta_destino).first()
+                destino_manual = False
+
         with st.form("transferencia_form"):
             col1, col2 = st.columns(2)
             with col1:
-                origen  = st.selectbox("Cuenta origen",  clientes,
-                                       format_func=lambda c: f"[{c.num_cuenta}] {c.nombre}  —  ${c.saldo:,.2f}")
+                origen = st.selectbox("Confirmar cuenta origen", clientes,
+                                      format_func=lambda c: f"[{c.num_cuenta}] {c.nombre}  —  ${c.saldo:,.2f}",
+                                      index=clientes.index(origen_sel) if origen_sel in clientes else 0)
             with col2:
-                destino = st.selectbox("Cuenta destino", clientes,
-                                       format_func=lambda c: f"[{c.num_cuenta}] {c.nombre}  —  ${c.saldo:,.2f}")
+                if destino_manual or not benefs:
+                    destino = st.selectbox("Cuenta destino", clientes,
+                                           format_func=lambda c: f"[{c.num_cuenta}] {c.nombre}  —  ${c.saldo:,.2f}")
+                else:
+                    destino = destino_cliente
+                    st.markdown(f"**Destino (beneficiario):** {benef_sel.alias} `{benef_sel.cuenta_destino}`")
             monto = st.number_input("Monto a transferir ($)", min_value=0.01,
                                     step=100.0, max_value=500_000.0)
             st.info(
@@ -779,6 +991,11 @@ def vista_operaciones(session):
                 audit(session, usuario_activo, "TRANSFERENCIA",
                       f"{origen.nombre} → {destino.nombre} — ${monto:,.2f}",
                       "OK" if ok else "ERROR")
+                if ok:
+                    aml_alerts = verificar_aml(session, origen.id, monto, "Transferencia")
+                    session.commit()
+                    if aml_alerts:
+                        st.warning(f"🚨 AML: {len(aml_alerts)} alerta(s) de prevención de lavado de dinero generada(s).")
                 alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
                 if ok: st.rerun()
 
@@ -837,12 +1054,16 @@ def vista_operaciones(session):
 
 def vista_prestamos(session):
     render_header("🏷️", "Gestión de préstamos")
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "➕ Otorgar préstamo",
         "💳 Pagar préstamo",
         "📋 Préstamos activos",
+        "🔄 Refinanciamiento",
+        "🛡️ Garantías",
     ])
     clientes = session.query(Cliente).order_by(Cliente.nombre).all()
+
+    CLASIFICACIONES = ["Personal", "Vivienda", "Comercio", "Agropecuario"]
 
     # ── Otorgar ──
     with tab1:
@@ -860,34 +1081,45 @@ def vista_prestamos(session):
                   f"   ·   (Capital: ${capital_banco:,.2f} – Préstamos activos: ${total_prest:,.2f})"
                   f"   ·   Interés fijo: <strong>10%</strong>")
             with st.form("prestamo_form"):
-                sel   = st.selectbox("Cliente", clientes,
-                                     format_func=lambda c: f"[{c.id}] {c.nombre}")
-                monto = st.number_input("Monto del préstamo ($)", min_value=100.0,
-                                        step=500.0, max_value=500_000.0)
-                plazo = st.selectbox("Plazo", [12,24,36,48,60])
-                
-                interes = monto * 0.10
+                col1, col2 = st.columns(2)
+                with col1:
+                    sel   = st.selectbox("Cliente", clientes,
+                                         format_func=lambda c: f"[{c.id}] {c.nombre} · Score: {c.score_credito or 500}")
+                    monto = st.number_input("Monto del préstamo ($)", min_value=100.0,
+                                            step=500.0, max_value=500_000.0)
+                    plazo = st.selectbox("Plazo (meses)", [6,12,24,36,48,60])
+                with col2:
+                    clasificacion = st.selectbox("Clasificación del crédito", CLASIFICACIONES)
+                    tasa_input    = st.number_input("Tasa de interés anual (%)", min_value=1.0,
+                                                     max_value=36.0, value=10.0, step=0.5)
+                    sucursales    = session.query(Sucursal).filter_by(activa=True).all()
+                    suc_sel       = st.selectbox("Sucursal", sucursales,
+                                                  format_func=lambda s: s.nombre) if sucursales else None
 
-                cuota = (monto + interes) / plazo
-
-                st.info(
-                    f"""
-                Capital: ${monto:,.2f}
-
-                Interés total: ${interes:,.2f}
-
-                Plazo: {plazo} meses
-
-                Cuota mensual: ${cuota:,.2f}
-
-                Deuda total: ${monto+interes:,.2f}
-                """
-                )
+                interes = monto * (tasa_input / 100)
+                cuota   = (monto + interes) / plazo
+                st.info(f"Capital: **${monto:,.2f}** · Interés total: **${interes:,.2f}** · "
+                        f"Cuota mensual: **${cuota:,.2f}** · Deuda total: **${monto+interes:,.2f}**")
                 enviado = st.form_submit_button("✅ Otorgar préstamo", type="primary")
             if enviado:
-                ok, msg = otorgar_prestamo(session,sel.id,monto,plazo)
-                alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
-                if ok: st.rerun()
+                # Verificar score antes de otorgar
+                score_cliente = sel.score_credito or 500
+                if score_cliente < 400:
+                    alert("error", f"✗ Score crediticio insuficiente ({score_cliente}). No se puede otorgar el préstamo.")
+                else:
+                    ok, msg = otorgar_prestamo(session, sel.id, monto, plazo)
+                    if ok:
+                        # Actualizar clasificación y sucursal en el préstamo recién creado
+                        ultimo_p = session.query(Prestamo).filter_by(
+                            cliente_id=sel.id, estado="ACTIVO"
+                        ).order_by(Prestamo.fecha.desc()).first()
+                        if ultimo_p:
+                            ultimo_p.clasificacion = clasificacion
+                            if suc_sel:
+                                ultimo_p.sucursal_id = suc_sel.id
+                            session.commit()
+                    alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
+                    if ok: st.rerun()
 
     # ── Pagar ──
     with tab2:
@@ -996,12 +1228,108 @@ def vista_prestamos(session):
                 "Registra 1/12 del interés anual de cada préstamo como "
                 "Intereses x Cobrar (activo) e Ingresos Intereses."
             )
-            if st.button("📅 Devengar intereses del período", type="primary"):
-                ok, msg = devengar_interes(session)
-                alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
-                if ok: st.rerun()
+            col_dev, col_mora = st.columns(2)
+            with col_dev:
+                if st.button("📅 Devengar intereses del período", type="primary"):
+                    ok, msg = devengar_interes(session)
+                    alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
+                    if ok: st.rerun()
+            with col_mora:
+                if st.button("⚠️ Actualizar cuotas vencidas (mora)"):
+                    n = actualizar_cuotas_vencidas(session)
+                    session.commit()
+                    st.success(f"✅ {n} cuota(s) marcadas como VENCIDA")
+                    st.rerun()
         else:
             alert("info", "No hay préstamos activos con saldo pendiente.")
+
+    # ── Refinanciamiento ──
+    with tab4:
+        st.markdown("### 🔄 Refinanciamiento de Préstamos")
+        st.caption("Convierte el saldo pendiente de un préstamo activo en un nuevo plan de pagos.")
+        prestamos_activos = (
+            session.query(Prestamo)
+            .filter(Prestamo.estado == "ACTIVO", Prestamo.saldo_pendiente > 0)
+            .options(selectinload(Prestamo.cliente))
+            .order_by(Prestamo.fecha.desc()).all()
+        )
+        if not prestamos_activos:
+            alert("info", "No hay préstamos activos para refinanciar.")
+        else:
+            p_sel = st.selectbox(
+                "Seleccionar préstamo a refinanciar",
+                prestamos_activos,
+                format_func=lambda p: f"#{p.id} — {p.cliente.nombre} · Saldo: ${float(p.saldo_pendiente):,.2f} · Plazo orig: {p.plazo_meses} meses",
+                key="refi_sel",
+            )
+            if p_sel:
+                st.info(f"Saldo pendiente actual: **${float(p_sel.saldo_pendiente):,.2f}** · Mora: **${float(p_sel.mora_acumulada or 0):,.2f}**")
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    nuevo_plazo = st.selectbox("Nuevo plazo (meses)", [12, 24, 36, 48, 60], key="refi_plazo")
+                with col_r2:
+                    nueva_tasa  = st.number_input("Nueva tasa anual (%)", min_value=1.0, max_value=36.0,
+                                                   value=10.0, step=0.5, key="refi_tasa")
+                nueva_cuota = float(p_sel.saldo_pendiente) * (1 + nueva_tasa/100) / nuevo_plazo
+                st.info(f"Nueva cuota estimada: **${nueva_cuota:,.2f}**/mes durante {nuevo_plazo} meses")
+                if st.button("✅ Confirmar Refinanciamiento", type="primary", key="btn_refi"):
+                    ok, result = refinanciar_prestamo(session, p_sel.id, nuevo_plazo, nueva_tasa/100)
+                    if ok:
+                        session.commit()
+                        st.success(f"✅ Préstamo #{result.id} creado. Cuota: ${float(result.cuota_mensual):,.2f}/mes")
+                        st.rerun()
+                    else:
+                        st.error(result)
+
+    # ── Garantías ──
+    with tab5:
+        st.markdown("### 🛡️ Garantías de Préstamos")
+        todos_prestamos = (
+            session.query(Prestamo)
+            .options(selectinload(Prestamo.cliente), selectinload(Prestamo.garantias))
+            .filter(Prestamo.estado.in_(["ACTIVO", "REFINANCIADO"]))
+            .order_by(Prestamo.fecha.desc()).all()
+        )
+        if not todos_prestamos:
+            alert("info", "No hay préstamos registrados.")
+        else:
+            pg_sel = st.selectbox(
+                "Préstamo",
+                todos_prestamos,
+                format_func=lambda p: f"#{p.id} — {p.cliente.nombre} · ${float(p.monto):,.2f} · {p.estado}",
+                key="gar_psel",
+            )
+            if pg_sel:
+                # Mostrar garantías existentes
+                if pg_sel.garantias:
+                    st.markdown("**Garantías registradas:**")
+                    for g in pg_sel.garantias:
+                        if g.activa:
+                            st.markdown(f"🛡️ **{g.tipo.upper()}** — {g.descripcion} · "
+                                        f"Valor: ${float(g.valor_estimado):,.2f} · Reg: {g.numero_registro or '—'}")
+                else:
+                    st.caption("Este préstamo no tiene garantías registradas.")
+
+                st.divider()
+                st.markdown("**➕ Agregar garantía**")
+                col_g1, col_g2 = st.columns(2)
+                with col_g1:
+                    tipo_g  = st.selectbox("Tipo de garantía", ["vehiculo", "casa", "terreno", "deposito", "fiador"], key="gar_tipo")
+                    valor_g = st.number_input("Valor estimado ($)", min_value=0.0, step=100.0, key="gar_val")
+                with col_g2:
+                    desc_g  = st.text_input("Descripción", key="gar_desc")
+                    reg_g   = st.text_input("Número de registro (matrícula, escritura...)", key="gar_reg")
+                if st.button("➕ Agregar Garantía", key="btn_gar"):
+                    if not desc_g.strip():
+                        st.error("La descripción es obligatoria.")
+                    else:
+                        ok, result = agregar_garantia(session, pg_sel.id, tipo_g, desc_g, valor_g, reg_g)
+                        if ok:
+                            session.commit()
+                            st.success(f"✅ Garantía agregada al préstamo #{pg_sel.id}")
+                            st.rerun()
+                        else:
+                            st.error(result)
 
 
 def vista_reportes(session):
@@ -1754,6 +2082,47 @@ def vista_configuracion(session, usuario):
     df_cfg = pd.DataFrame(filas)
     st.dataframe(df_cfg, use_container_width=True, hide_index=True)
 
+    # ── Gestión de Tipos de Cuenta ──
+    st.divider()
+    st.markdown("#### 🏦 Tipos de Cuenta")
+    tipos = session.query(TipoCuenta).all()
+    if tipos:
+        data_tc = [{"ID": t.id, "Nombre": t.nombre,
+                    "Tasa anual": f"{float(t.tasa_interes)*100:.2f}%",
+                    "Saldo mínimo": f"${float(t.saldo_minimo):,.2f}",
+                    "Comisión": "Sí" if t.cobra_comision else "No",
+                    "Activo": "✅" if t.activo else "❌"} for t in tipos]
+        st.dataframe(pd.DataFrame(data_tc), use_container_width=True, hide_index=True)
+
+    with st.expander("➕ Agregar tipo de cuenta"):
+        col_tc1, col_tc2 = st.columns(2)
+        with col_tc1:
+            tc_nombre   = st.text_input("Nombre del tipo", key="tc_nom")
+            tc_tasa     = st.number_input("Tasa de interés anual (%)", min_value=0.0, max_value=20.0, value=3.0, step=0.5, key="tc_tasa")
+            tc_saldo    = st.number_input("Saldo mínimo ($)", min_value=0.0, value=0.0, step=10.0, key="tc_saldo")
+        with col_tc2:
+            tc_comision = st.checkbox("Cobra comisión mensual", key="tc_com")
+            tc_desc     = st.text_area("Descripción", height=80, key="tc_desc")
+        if st.button("Crear tipo de cuenta", key="btn_create_tc"):
+            from extras import crear_tipo_cuenta
+            ok, result = crear_tipo_cuenta(session, tc_nombre, tc_tasa/100, tc_saldo, tc_comision, tc_desc)
+            if ok:
+                session.commit()
+                st.success(f"✅ Tipo '{result.nombre}' creado")
+                st.rerun()
+            else:
+                st.error(result)
+
+    # ── Gestión de Sucursales ──
+    st.divider()
+    st.markdown("#### 🏢 Sucursales")
+    suc_list = session.query(Sucursal).order_by(Sucursal.nombre).all()
+    if suc_list:
+        data_s = [{"Nombre": s.nombre, "Dirección": s.direccion,
+                   "Teléfono": s.telefono or "—", "Caja": f"${float(s.saldo_caja):,.2f}",
+                   "Activa": "✅" if s.activa else "❌"} for s in suc_list]
+        st.dataframe(pd.DataFrame(data_s), use_container_width=True, hide_index=True)
+
 
 # ─────────────────────────────
 # VISTA: ALERTAS DEL SISTEMA
@@ -1981,6 +2350,448 @@ def _render_alertas_badge(session):
         pass
 
 
+# ═══════════════════════════════════════════════════════════
+#  VISTA: TARJETAS
+# ═══════════════════════════════════════════════════════════
+
+def vista_tarjetas(session, usuario):
+    render_header("💳", "Tarjetas", "Débito y crédito")
+    tab1, tab2 = st.tabs(["Tarjetas de Débito", "Tarjetas de Crédito"])
+
+    with tab1:
+        st.subheader("Tarjetas de Débito")
+        clientes = session.query(Cliente).filter(Cliente.estado == "ACTIVO").order_by(Cliente.nombre).all()
+        if tiene_permiso(usuario, "gestionar_tarjetas"):
+            with st.expander("➕ Emitir Tarjeta de Débito"):
+                c_sel = st.selectbox("Cliente", clientes, format_func=lambda c: f"{c.nombre} ({c.num_cuenta})", key="td_cliente")
+                if st.button("Emitir", key="btn_td"):
+                    ok, result = emitir_tarjeta_debito(session, c_sel.id)
+                    if ok:
+                        session.commit()
+                        st.success(f"✅ Tarjeta emitida: {result.numero[:4]}...{result.numero[-4:]}")
+                    else:
+                        st.error(result)
+
+        tarjetas = session.query(TarjetaDebito).all()
+        if tarjetas:
+            data = []
+            for t in tarjetas:
+                c = session.query(Cliente).filter_by(id=t.cliente_id).first()
+                data.append({"Cliente": c.nombre if c else "—", "Número": f"****{t.numero[-4:]}",
+                              "Vencimiento": t.vencimiento, "Estado": t.estado,
+                              "Emitida": t.creado_en.strftime("%Y-%m-%d") if t.creado_en else "—"})
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+        else:
+            st.info("No hay tarjetas de débito registradas.")
+
+    with tab2:
+        st.subheader("Tarjetas de Crédito")
+        if tiene_permiso(usuario, "gestionar_tarjetas"):
+            with st.expander("➕ Emitir Tarjeta de Crédito"):
+                c_sel2 = st.selectbox("Cliente", clientes, format_func=lambda c: f"{c.nombre} (Score: {c.score_credito})", key="tc_cliente")
+                limite = st.number_input("Límite de crédito ($)", min_value=100.0, value=500.0, step=100.0)
+                if st.button("Emitir", key="btn_tc"):
+                    ok, result = emitir_tarjeta_credito(session, c_sel2.id, limite)
+                    if ok:
+                        session.commit()
+                        st.success(f"✅ Tarjeta crédito emitida: {result.numero[:4]}...{result.numero[-4:]} | Límite: ${float(result.limite):,.2f}")
+                    else:
+                        st.error(result)
+
+        tarjetas_c = session.query(TarjetaCredito).all()
+        if tarjetas_c:
+            data = []
+            for t in tarjetas_c:
+                c = session.query(Cliente).filter_by(id=t.cliente_id).first()
+                disponible = float(t.limite) - float(t.saldo_usado)
+                data.append({"Cliente": c.nombre if c else "—",
+                              "Número": f"****{t.numero[-4:]}",
+                              "Límite": f"${float(t.limite):,.2f}",
+                              "Usado": f"${float(t.saldo_usado):,.2f}",
+                              "Disponible": f"${disponible:,.2f}",
+                              "Corte día": t.fecha_corte,
+                              "Estado": t.estado})
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+        else:
+            st.info("No hay tarjetas de crédito registradas.")
+
+
+# ═══════════════════════════════════════════════════════════
+#  VISTA: SUCURSALES & ATM
+# ═══════════════════════════════════════════════════════════
+
+def vista_sucursales(session, usuario):
+    render_header("🏦", "Sucursales & ATM", "Red de atención")
+    tab1, tab2 = st.tabs(["Sucursales", "Cajeros ATM"])
+
+    with tab1:
+        sucursales = session.query(Sucursal).order_by(Sucursal.nombre).all()
+        if tiene_permiso(usuario, "gestionar_sucursales"):
+            with st.expander("➕ Nueva Sucursal"):
+                nombre_s = st.text_input("Nombre", key="suc_nom")
+                dir_s    = st.text_input("Dirección", key="suc_dir")
+                tel_s    = st.text_input("Teléfono", key="suc_tel")
+                if st.button("Crear Sucursal"):
+                    from extras import crear_sucursal
+                    ok, result = crear_sucursal(session, nombre_s, dir_s, tel_s)
+                    if ok:
+                        session.commit()
+                        st.success(f"✅ Sucursal {result.nombre} creada")
+                        st.rerun()
+                    else:
+                        st.error(result)
+
+        cols = st.columns(2)
+        for i, s in enumerate(sucursales):
+            cnt_clientes = session.query(func.count(Cliente.id)).filter_by(sucursal_id=s.id).scalar() or 0
+            cnt_atm = session.query(func.count(ATM.id)).filter_by(sucursal_id=s.id).scalar() or 0
+            with cols[i % 2]:
+                estado_color = "#2ecc71" if s.activa else "#e74c3c"
+                st.markdown(f"""
+<div style="background:#1e1e2e;border:1px solid #3d3b3c;border-radius:10px;padding:16px;margin-bottom:12px">
+  <div style="font-size:1.1rem;font-weight:700;color:#e8e4d9">{s.nombre}</div>
+  <div style="color:#8a8694;font-size:.82rem">{s.direccion or "—"}</div>
+  <div style="margin-top:8px;display:flex;gap:12px">
+    <span style="color:#7ec8c8">👥 {cnt_clientes} clientes</span>
+    <span style="color:#a89cc8">🏧 {cnt_atm} ATM(s)</span>
+    <span style="color:{estado_color}">● {"Activa" if s.activa else "Inactiva"}</span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    with tab2:
+        atms = session.query(ATM).all()
+        if atms:
+            data = []
+            for a in atms:
+                suc = session.query(Sucursal).filter_by(id=a.sucursal_id).first()
+                data.append({"Sucursal": suc.nombre if suc else "—",
+                              "Ubicación": a.ubicacion,
+                              "Estado": a.estado,
+                              "Saldo ATM": f"${float(a.saldo_atm):,.2f}"})
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+        else:
+            st.info("No hay ATMs registrados.")
+
+
+# ═══════════════════════════════════════════════════════════
+#  VISTA: PLAZO FIJO
+# ═══════════════════════════════════════════════════════════
+
+def vista_plazo_fijo(session, usuario):
+    from datetime import date
+    render_header("📑", "Depósitos a Plazo Fijo", "Certificados de depósito")
+    tab1, tab2 = st.tabs(["Certificados Activos", "Nuevo Depósito"])
+
+    with tab2:
+        if tiene_permiso(usuario, "gestionar_plazo_fijo"):
+            clientes = session.query(Cliente).filter(Cliente.estado == "ACTIVO").order_by(Cliente.nombre).all()
+            c_sel = st.selectbox("Cliente", clientes, format_func=lambda c: f"{c.nombre} | Saldo: ${float(c.saldo):,.2f}")
+            col1, col2 = st.columns(2)
+            with col1:
+                monto  = st.number_input("Monto ($)", min_value=500.0, value=1000.0, step=500.0)
+                plazo  = st.selectbox("Plazo (meses)", [3, 6, 12, 18, 24, 36, 48, 60])
+            with col2:
+                tasa   = st.number_input("Tasa anual (%)", min_value=1.0, max_value=15.0, value=5.0, step=0.5) / 100
+                renov  = st.checkbox("Renovación automática")
+            interes_proy = monto * tasa * plazo / 12
+            st.info(f"📊 Interés proyectado: **${interes_proy:,.2f}** | Total al vencimiento: **${monto + interes_proy:,.2f}**")
+            if st.button("✅ Crear Depósito", type="primary"):
+                ok, result = crear_deposito_plazo(session, c_sel.id, monto, tasa, plazo, renov)
+                if ok:
+                    session.commit()
+                    st.success(f"✅ Certificado {result.num_certificado} creado. Vence: {result.fecha_vencimiento}")
+                    st.rerun()
+                else:
+                    st.error(result)
+
+    with tab1:
+        depositos = session.query(DepositoPlazoFijo).order_by(DepositoPlazoFijo.fecha_apertura.desc()).all()
+        if depositos:
+            hoy = date.today()
+            data = []
+            for d in depositos:
+                c = session.query(Cliente).filter_by(id=d.cliente_id).first()
+                dias_rest = (d.fecha_vencimiento - hoy).days if d.fecha_vencimiento else 0
+                data.append({
+                    "Certificado": d.num_certificado,
+                    "Cliente": c.nombre if c else "—",
+                    "Monto": f"${float(d.monto):,.2f}",
+                    "Tasa": f"{float(d.tasa_anual)*100:.1f}%",
+                    "Plazo": f"{d.plazo_meses} meses",
+                    "Vencimiento": str(d.fecha_vencimiento),
+                    "Total": f"${float(d.monto_total):,.2f}",
+                    "Estado": d.estado,
+                    "Días rest.": dias_rest,
+                })
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+
+            if tiene_permiso(usuario, "gestionar_plazo_fijo"):
+                vencidos = [d for d in depositos if d.estado == "ACTIVO" and
+                            d.fecha_vencimiento and d.fecha_vencimiento <= hoy]
+                if vencidos:
+                    st.warning(f"⚠️ {len(vencidos)} depósito(s) vencido(s) pendientes de pago.")
+                    dpf_sel = st.selectbox("Pagar vencimiento", vencidos,
+                                           format_func=lambda d: f"{d.num_certificado} — ${float(d.monto_total):,.2f}")
+                    if st.button("💰 Pagar al cliente", type="primary"):
+                        ok, result = vencer_deposito_plazo(session, dpf_sel.id, usuario.username)
+                        if ok:
+                            session.commit()
+                            st.success(f"✅ ${float(result.monto_total):,.2f} acreditados al cliente")
+                            st.rerun()
+                        else:
+                            st.error(result)
+        else:
+            st.info("No hay depósitos a plazo fijo registrados.")
+
+
+# ═══════════════════════════════════════════════════════════
+#  VISTA: SOCIOS
+# ═══════════════════════════════════════════════════════════
+
+def vista_socios(session, usuario):
+    render_header("🤝", "Socios", "Caja de Crédito — Capital Social")
+    tab1, tab2, tab3 = st.tabs(["Lista de Socios", "Registrar Socio", "Aportes"])
+
+    with tab1:
+        socios = session.query(Socio).all()
+        if socios:
+            data = []
+            for s in socios:
+                c = session.query(Cliente).filter_by(id=s.cliente_id).first()
+                data.append({"#": s.numero_socio, "Nombre": c.nombre if c else "—",
+                              "Estado": s.estado, "Aporte Total": f"${float(s.aporte_total):,.2f}",
+                              "Ingreso": str(s.fecha_ingreso)})
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+            total_capital = sum(float(s.aporte_total) for s in socios)
+            st.metric("Capital Social Total", f"${total_capital:,.2f}")
+        else:
+            st.info("No hay socios registrados.")
+
+    with tab2:
+        if tiene_permiso(usuario, "gestionar_socios"):
+            clientes = session.query(Cliente).filter(Cliente.estado == "ACTIVO").order_by(Cliente.nombre).all()
+            ids_socios = {s.cliente_id for s in session.query(Socio).all()}
+            disponibles = [c for c in clientes if c.id not in ids_socios]
+            if disponibles:
+                c_sel = st.selectbox("Cliente", disponibles, format_func=lambda c: c.nombre)
+                aporte_ini = st.number_input("Aporte inicial ($)", min_value=0.0, value=100.0, step=50.0)
+                if st.button("✅ Registrar Socio", type="primary"):
+                    ok, result = registrar_socio(session, c_sel.id, aporte_ini)
+                    if ok:
+                        session.commit()
+                        st.success(f"✅ Socio registrado: {result.numero_socio}")
+                        st.rerun()
+                    else:
+                        st.error(result)
+            else:
+                st.info("Todos los clientes activos ya son socios.")
+
+    with tab3:
+        if tiene_permiso(usuario, "gestionar_socios"):
+            socios_list = session.query(Socio).filter_by(estado="ACTIVO").all()
+            if socios_list:
+                def _nombre_socio(s):
+                    c = session.query(Cliente).filter_by(id=s.cliente_id).first()
+                    return f"{s.numero_socio} — {c.nombre if c else '—'}"
+                socio_sel = st.selectbox("Socio", socios_list, format_func=_nombre_socio)
+                monto_a = st.number_input("Monto del aporte ($)", min_value=1.0, value=50.0, step=10.0)
+                tipo_a  = st.selectbox("Tipo", ["ORDINARIO", "EXTRAORDINARIO"])
+                desc_a  = st.text_input("Descripción", "Aporte mensual")
+                if st.button("💰 Registrar Aporte", type="primary"):
+                    ok, result = registrar_aporte(session, socio_sel.id, monto_a, tipo_a, desc_a)
+                    if ok:
+                        session.commit()
+                        st.success(f"✅ Aporte de ${monto_a:,.2f} registrado")
+                    else:
+                        st.error(result)
+
+
+# ═══════════════════════════════════════════════════════════
+#  VISTA: MONITOR AML
+# ═══════════════════════════════════════════════════════════
+
+def vista_aml(session, usuario):
+    render_header("🚨", "Monitor AML", "Prevención de Lavado de Dinero")
+    tab1, tab2 = st.tabs(["Alertas Pendientes", "Historial"])
+
+    def _color_nivel(n):
+        return "#e74c3c" if n == "CRITICA" else "#f39c12"
+
+    with tab1:
+        alertas = obtener_alertas_aml(session, estado="PENDIENTE")
+        if alertas:
+            st.warning(f"⚠️ {len(alertas)} alerta(s) pendientes de revisión")
+            for a in alertas:
+                c = session.query(Cliente).filter_by(id=a.cliente_id).first()
+                color = _color_nivel(a.nivel)
+                st.markdown(f"""
+<div style="background:#1e1e2e;border-left:4px solid {color};padding:12px 16px;border-radius:6px;margin-bottom:10px">
+  <div style="display:flex;justify-content:space-between">
+    <span style="color:{color};font-weight:700">{a.tipo}</span>
+    <span style="color:#8a8694;font-size:.8rem">{a.fecha.strftime("%Y-%m-%d %H:%M") if a.fecha else "—"}</span>
+  </div>
+  <div style="color:#e8e4d9;margin:4px 0">{a.descripcion}</div>
+  <div style="color:#8a8694;font-size:.82rem">Cliente: {c.nombre if c else "—"}</div>
+</div>""", unsafe_allow_html=True)
+
+            if tiene_permiso(usuario, "gestionar_aml"):
+                st.divider()
+                a_sel = st.selectbox("Seleccionar alerta para revisar", alertas,
+                                     format_func=lambda a: f"#{a.id} — {a.tipo} ({a.nivel})")
+                notas = st.text_area("Notas de revisión")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("✅ Marcar Revisada"):
+                        ok, _ = revisar_alerta_aml(session, a_sel.id, usuario.username, notas, cerrar=False)
+                        if ok:
+                            session.commit()
+                            st.success("Alerta marcada como revisada")
+                            st.rerun()
+                with col2:
+                    if st.button("🔒 Cerrar Alerta"):
+                        ok, _ = revisar_alerta_aml(session, a_sel.id, usuario.username, notas, cerrar=True)
+                        if ok:
+                            session.commit()
+                            st.success("Alerta cerrada")
+                            st.rerun()
+        else:
+            st.success("✅ No hay alertas AML pendientes")
+
+    with tab2:
+        todas = obtener_alertas_aml(session, estado="TODAS")
+        if todas:
+            data = []
+            for a in todas:
+                c = session.query(Cliente).filter_by(id=a.cliente_id).first()
+                data.append({"#": a.id, "Tipo": a.tipo, "Nivel": a.nivel,
+                              "Cliente": c.nombre if c else "—",
+                              "Monto": f"${float(a.monto):,.2f}" if a.monto else "—",
+                              "Estado": a.estado,
+                              "Fecha": a.fecha.strftime("%Y-%m-%d %H:%M") if a.fecha else "—",
+                              "Revisado por": a.revisado_por or "—"})
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════
+#  VISTA: DASHBOARD GERENCIAL
+# ═══════════════════════════════════════════════════════════
+
+def vista_dashboard_gerencial(session):
+    from datetime import date
+    from contabilidad import caja_real
+    render_header("📊", "Dashboard Gerencial", "Indicadores clave del banco")
+
+    total_clientes  = session.query(func.count(Cliente.id)).filter(Cliente.estado == "ACTIVO").scalar() or 0
+    total_prestamos_cnt = session.query(func.count(Prestamo.id)).filter(Prestamo.estado == "ACTIVO").scalar() or 0
+    cartera         = session.query(func.coalesce(func.sum(Prestamo.saldo_pendiente), 0)).filter(Prestamo.estado == "ACTIVO").scalar()
+    mora_total      = session.query(func.coalesce(func.sum(Prestamo.mora_acumulada), 0)).filter(Prestamo.estado == "ACTIVO").scalar()
+    total_depositos = session.query(func.coalesce(func.sum(Cliente.saldo), 0)).filter(Cliente.estado == "ACTIVO").scalar()
+    caja = caja_real(session)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("👥 Clientes activos", total_clientes)
+    col2.metric("🏷️ Préstamos activos", total_prestamos_cnt)
+    col3.metric("💼 Cartera total", f"${float(cartera):,.2f}")
+    col4.metric("⚠️ Mora acumulada", f"${float(mora_total):,.2f}")
+
+    col5, col6 = st.columns(2)
+    col5.metric("💰 Total depósitos", f"${float(total_depositos):,.2f}")
+    col6.metric("🏦 Caja actual", f"${float(caja):,.2f}")
+
+    st.divider()
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        rows = (session.query(Prestamo.clasificacion, func.sum(Prestamo.saldo_pendiente))
+                .filter(Prestamo.estado == "ACTIVO")
+                .group_by(Prestamo.clasificacion).all())
+        if rows:
+            df_prest = pd.DataFrame(rows, columns=["Clasificación", "Cartera"])
+            fig = px.pie(df_prest, names="Clasificación", values="Cartera",
+                         title="Cartera por clasificación",
+                         color_discrete_sequence=COLORES)
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#E8E4D9")
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col_r:
+        rows2 = (session.query(Cliente.tipo, func.sum(Cliente.saldo))
+                 .filter(Cliente.estado == "ACTIVO")
+                 .group_by(Cliente.tipo).all())
+        if rows2:
+            df_dep = pd.DataFrame(rows2, columns=["Tipo", "Saldo"])
+            fig2 = px.bar(df_dep, x="Tipo", y="Saldo",
+                          title="Depósitos por tipo de cuenta",
+                          color_discrete_sequence=COLORES)
+            fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)", font_color="#E8E4D9")
+            st.plotly_chart(fig2, use_container_width=True)
+
+    # Balance General
+    st.subheader("📋 Balance General")
+    bg = generar_balance_general(session)
+    col_a, col_p, col_pat = st.columns(3)
+    with col_a:
+        st.markdown("**ACTIVOS**")
+        for nombre, val in bg["activos"]:
+            st.markdown(f"&nbsp;&nbsp;{nombre}: **${val:,.2f}**")
+        st.markdown(f"**Total Activo: ${bg['total_activo']:,.2f}**")
+    with col_p:
+        st.markdown("**PASIVOS**")
+        for nombre, val in bg["pasivos"]:
+            st.markdown(f"&nbsp;&nbsp;{nombre}: **${val:,.2f}**")
+        st.markdown(f"**Total Pasivo: ${bg['total_pasivo']:,.2f}**")
+    with col_pat:
+        st.markdown("**PATRIMONIO**")
+        for nombre, val in bg["patrimonio"]:
+            st.markdown(f"&nbsp;&nbsp;{nombre}: **${val:,.2f}**")
+        st.markdown(f"**Total Patrimonio: ${bg['total_patrimonio']:,.2f}**")
+
+    eq = "✅ Ecuación cuadra" if bg["ecuacion_ok"] else "❌ Ecuación no cuadra"
+    st.info(f"{eq} — A={bg['total_activo']:,.2f} = P+Pat={bg['total_pasivo']+bg['total_patrimonio']:,.2f}")
+
+    # Estado de Resultados
+    st.subheader("📊 Estado de Resultados")
+    er = generar_estado_resultados(session)
+    col_i, col_g = st.columns(2)
+    with col_i:
+        st.markdown("**INGRESOS**")
+        for nombre, val in er["ingresos"]:
+            st.markdown(f"&nbsp;&nbsp;{nombre}: **${val:,.2f}**")
+        st.markdown(f"**Total Ingresos: ${er['total_ingresos']:,.2f}**")
+    with col_g:
+        st.markdown("**GASTOS**")
+        for nombre, val in er["gastos"]:
+            st.markdown(f"&nbsp;&nbsp;{nombre}: **${val:,.2f}**")
+        st.markdown(f"**Total Gastos: ${er['total_gastos']:,.2f}**")
+
+    utilidad = er["utilidad"]
+    st.metric("💹 Utilidad Neta", f"${utilidad:,.2f}")
+
+    # Cierre diario
+    st.divider()
+    st.subheader("🔒 Cierre Diario")
+    hoy = date.today()
+    ultimo_cierre = (session.query(CierreDiario).order_by(CierreDiario.fecha.desc()).first())
+    if ultimo_cierre:
+        st.info(f"Último cierre: {ultimo_cierre.fecha} | Caja final: ${float(ultimo_cierre.caja_final):,.2f}")
+    else:
+        st.warning("No se ha realizado ningún cierre diario.")
+
+    cierre_hoy = session.query(CierreDiario).filter_by(fecha=hoy).first()
+    if not cierre_hoy:
+        notas_c = st.text_input("Notas del cierre", key="notas_cierre")
+        if st.button("🔒 Realizar Cierre del Día", type="primary"):
+            ok, result = realizar_cierre_diario(session, "Gerente", notas_c)
+            if ok:
+                session.commit()
+                st.success(f"✅ Cierre realizado — Depósitos: ${float(result.total_depositos):,.2f} | Retiros: ${float(result.total_retiros):,.2f}")
+                st.rerun()
+            else:
+                st.error(result)
+    else:
+        st.success(f"✅ Cierre de hoy ya realizado — Caja: ${float(cierre_hoy.caja_final):,.2f}")
+
+
+
 def main():
     st.set_page_config(
         page_title="Sistema Bancario",
@@ -1993,6 +2804,9 @@ def main():
 
     try:
         inicializar_contabilidad(session)
+        inicializar_tipos_cuenta(session)
+        inicializar_sucursales(session)
+        session.commit()
 
         # ── Primer arranque: sin usuarios ──
         if not hay_usuarios(session):
@@ -2120,6 +2934,36 @@ def main():
                 vista_alertas(session)
             else:
                 _acceso_denegado("ver_alertas")
+        elif opcion == "💳 Tarjetas":
+            if tiene_permiso(usuario, "ver_tarjetas"):
+                vista_tarjetas(session, usuario)
+            else:
+                _acceso_denegado("ver_tarjetas")
+        elif opcion == "🏦 Sucursales & ATM":
+            if tiene_permiso(usuario, "ver_sucursales"):
+                vista_sucursales(session, usuario)
+            else:
+                _acceso_denegado("ver_sucursales")
+        elif opcion == "📑 Plazo Fijo":
+            if tiene_permiso(usuario, "ver_plazo_fijo"):
+                vista_plazo_fijo(session, usuario)
+            else:
+                _acceso_denegado("ver_plazo_fijo")
+        elif opcion == "🤝 Socios":
+            if tiene_permiso(usuario, "ver_socios"):
+                vista_socios(session, usuario)
+            else:
+                _acceso_denegado("ver_socios")
+        elif opcion == "🚨 Monitor AML":
+            if tiene_permiso(usuario, "ver_aml"):
+                vista_aml(session, usuario)
+            else:
+                _acceso_denegado("ver_aml")
+        elif opcion == "📊 Dashboard Gerencial":
+            if tiene_permiso(usuario, "ver_dashboard_gerencial"):
+                vista_dashboard_gerencial(session)
+            else:
+                _acceso_denegado("ver_dashboard_gerencial")
 
     finally:
         session.close()

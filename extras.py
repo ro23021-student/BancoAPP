@@ -219,12 +219,13 @@ def vencer_deposito_plazo(session, dpf_id, usuario_nombre="Sistema"):
         descripcion=f"Vencimiento plazo fijo #{dpf.num_certificado} (capital + intereses)",
     ))
 
-    # Al vencer el DPF, el banco devuelve el capital (sale de Caja) y paga interés (Ingreso).
-    # El saldo del cliente sube => Depositos Clientes aumenta (Crédito).
+    # Asiento de vencimiento: el banco devuelve al cliente capital + intereses.
+    # El saldo del cliente sube en monto_total => Depositos Clientes sube igual.
+    # Los intereses del DPF se acreditan a Ingresos Intereses por separado.
     registrar(session,
-              debitos=[("Caja General", dpf.monto_total)],
-              creditos=[("Depositos Clientes", dpf.monto),
-                        ("Ingresos Intereses", dpf.interes_proyectado)],
+              debitos=[("Ingresos Intereses", dpf.interes_proyectado),
+                       ("Caja General",       dpf.monto)],
+              creditos=[("Depositos Clientes", dpf.monto_total)],
               descripcion=f"Vencimiento DPF {dpf.num_certificado}")
     session.flush()
     return True, dpf
@@ -425,7 +426,7 @@ UMBRAL_AML_TRANSFERENCIAS_DIA = 5
 def verificar_aml(session, cliente_id, monto, tipo_operacion=""):
     alertas_generadas = []
     monto = money(monto)
-    hoy = datetime.now().date()
+    hoy = datetime.utcnow().date()
 
     # Regla 1: monto alto
     if monto >= UMBRAL_AML_MONTO:
@@ -485,7 +486,7 @@ def revisar_alerta_aml(session, alerta_id, revisor, notas="", cerrar=False):
 # ─────────────────────────────────────────────────────────────
 
 def realizar_cierre_diario(session, usuario_nombre, notas=""):
-    hoy = date.today()
+    hoy = datetime.utcnow().date()
     if session.query(CierreDiario).filter_by(fecha=hoy).first():
         return False, "Ya se realizó el cierre de hoy"
 
@@ -538,23 +539,57 @@ def realizar_cierre_diario(session, usuario_nombre, notas=""):
 # ─────────────────────────────────────────────────────────────
 
 def generar_balance_general(session):
+
     cuentas = session.query(CuentaContable).all()
-    activos = [(c.nombre, c.saldo(session)) for c in cuentas if c.categoria == "ACTIVO"]
-    pasivos = [(c.nombre, c.saldo(session)) for c in cuentas if c.categoria == "PASIVO"]
-    patrimonio = [(c.nombre, c.saldo(session)) for c in cuentas if c.categoria == "PATRIMONIO"]
+
+    activos = []
+    pasivos = []
+    patrimonio = []
+    ingresos = []
+    gastos = []
+
+    for c in cuentas:
+
+        saldo = c.saldo(session)
+
+        if c.categoria == "ACTIVO":
+            activos.append((c.nombre, saldo))
+
+        elif c.categoria == "PASIVO":
+            pasivos.append((c.nombre, saldo))
+
+        elif c.categoria == "PATRIMONIO":
+            patrimonio.append((c.nombre, saldo))
+
+        elif c.categoria == "INGRESO":
+            ingresos.append((c.nombre, saldo))
+
+        elif c.categoria == "GASTO":
+            gastos.append((c.nombre, saldo))
 
     total_activo = sum(v for _, v in activos)
+
     total_pasivo = sum(v for _, v in pasivos)
-    total_patrimonio = sum(v for _, v in patrimonio)
+
+    total_patrimonio = (
+        sum(v for _, v in patrimonio)
+        + sum(v for _, v in ingresos)
+        - sum(v for _, v in gastos)
+    )
 
     return {
         "activos": activos,
         "pasivos": pasivos,
         "patrimonio": patrimonio,
+        "ingresos": ingresos,
+        "gastos": gastos,
         "total_activo": total_activo,
         "total_pasivo": total_pasivo,
         "total_patrimonio": total_patrimonio,
-        "ecuacion_ok": round(total_activo, 2) == round(total_pasivo + total_patrimonio, 2),
+        "ecuacion_ok":
+            round(total_activo, 2)
+            ==
+            round(total_pasivo + total_patrimonio, 2),
         "fecha": date.today(),
     }
 
@@ -617,7 +652,7 @@ def registrar_aporte(session, socio_id, monto, tipo="ORDINARIO", descripcion="")
 
     aporte = AporteSocio(socio_id=socio_id, monto=monto, tipo=tipo, descripcion=descripcion)
     session.add(aporte)
-    socio.aporte_total += monto
+    socio.aporte_total = money(socio.aporte_total or 0) + monto
 
     # Asiento: Caja / Capital Social
     registrar(session,

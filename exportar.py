@@ -18,6 +18,10 @@ from reportlab.platypus import (
     Spacer, HRFlowable
 )
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+import os
+
+CARPETA_EXPORTACIONES = os.path.join(os.path.dirname(__file__), "exportaciones")
+
 
 
 # ─── Paleta de colores ───────────────────────────────────────

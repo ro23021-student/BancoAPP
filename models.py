@@ -26,9 +26,9 @@ def _gen_num_cuenta():
 
 
 def _gen_num_trx():
-    """Genera número de transacción: TRX-YYYYMMDD-NNNNNN"""
-    hoy  = datetime.now().strftime("%Y%m%d")
-    rand = ''.join(random.choices(string.digits, k=6))
+    """Genera número de transacción: TRX-YYYYMMDD-NNNNNNNNNN (10 dígitos para evitar colisiones)"""
+    hoy  = datetime.utcnow().strftime("%Y%m%d")
+    rand = ''.join(random.choices(string.digits, k=10))
     return f"TRX-{hoy}-{rand}"
 
 
@@ -126,7 +126,7 @@ class Movimiento(BaseLocal):
     tipo          = Column(String)
     monto         = Column(Numeric(12, 2))
     descripcion   = Column(String)
-    fecha         = Column(DateTime, default=datetime.now)
+    fecha         = Column(DateTime, default=datetime.utcnow)
     canal         = Column(String, default="VENTANILLA")  # VENTANILLA | ATM | EN_LINEA
     sucursal_id   = Column(Integer, ForeignKey("sucursales.id"), nullable=True)
     atm_id        = Column(Integer, ForeignKey("atms.id"), nullable=True)

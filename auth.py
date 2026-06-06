@@ -76,7 +76,7 @@ MENU_POR_ROL = {
                 "🔍 Reconciliación", "⚙️ Configuración", "🔔 Alertas",
                 "👤 Gestión de usuarios", "📋 Log de auditoría"],
     "GERENTE": ["📊 Panel principal", "👥 Clientes", "🏷️ Préstamos",
-                "💳 Tarjetas", "🏦 Sucursales & ATM", "📑 Plazo Fijo",
+                "💳 Tarjetas", "🏦 Sucursales & ATM", "📑 Plazo Fijo", "🤝 Socios",
                 "🚨 Monitor AML", "📈 Reportes contables",
                 "📊 Dashboard Gerencial", "🔍 Reconciliación",
                 "🔔 Alertas", "📋 Log de auditoría"],

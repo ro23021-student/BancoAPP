@@ -6,10 +6,56 @@ como el libro mayor contable, garantizando consistencia.
 
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+import re
 MIN_TRANSACCION = Decimal("1.00")
 from sqlalchemy import func
 from models import Cliente, CuotaPrestamo, Movimiento, Prestamo, ConfigBanco
 from contabilidad import money, f, registrar, saldo_cuenta, caja_real
+
+
+# ─── Validadores de formato ──────────────────────────────────
+
+def _validar_dui(dui):
+    """DUI salvadoreño: 8 dígitos, guión, 1 dígito. Ej: 06190312-5"""
+    if not dui: return True, ""
+    if not re.fullmatch(r"\d{8}-\d", dui.strip()):
+        return False, "DUI inválido. Formato requerido: 00000000-0"
+    return True, ""
+
+def _validar_nit(nit):
+    """NIT salvadoreño. Ej: 0614-190190-001-5"""
+    if not nit: return True, ""
+    if not re.fullmatch(r"\d{4}-\d{6}-\d{3}-\d", nit.strip()):
+        return False, "NIT inválido. Formato requerido: 0000-000000-000-0"
+    return True, ""
+
+def _validar_telefono(tel):
+    """Teléfono El Salvador: empieza con 2, 6 o 7. Ej: 7777-1234"""
+    if not tel: return True, ""
+    if not re.fullmatch(r"[267]\d{3}-\d{4}", tel.strip()):
+        return False, "Teléfono inválido. Formato requerido: 7777-1234 (inicia con 2, 6 o 7)"
+    return True, ""
+
+def _validar_fecha_nacimiento(fecha):
+    """Fecha YYYY-MM-DD. Edad entre 15 y 120 años."""
+    if not fecha: return True, ""
+    try:
+        dt = datetime.strptime(fecha.strip(), "%Y-%m-%d")
+    except ValueError:
+        return False, "Fecha inválida. Formato requerido: YYYY-MM-DD (ej: 1990-05-15)"
+    edad = (datetime.now() - dt).days // 365
+    if edad < 15:
+        return False, f"El cliente debe tener al menos 15 años (edad calculada: {edad})"
+    if edad > 120:
+        return False, f"Fecha de nacimiento no válida (edad calculada: {edad} años)"
+    return True, ""
+
+def _validar_email(email):
+    """Email formato usuario@dominio.ext"""
+    if not email: return True, ""
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$", email.strip()):
+        return False, "Email inválido. Formato requerido: nombre@correo.com"
+    return True, ""
 
 
 # ─── Tasas configurables (desde ConfigBanco) ─────────────────
@@ -97,9 +143,29 @@ def crear_cliente(session, nombre, tipo, saldo_inicial,
             return False, f"Ya existe un cliente con ese documento ({documento})"
 
     if email:
-        email = email.strip()
-        if "@" not in email or "." not in email.split("@")[-1]:
-            return False, "El formato del email no es válido"
+        ok_e, msg_e = _validar_email(email)
+        if not ok_e:
+            return False, msg_e
+
+    if documento and tipo_documento == "DUI":
+        ok_d, msg_d = _validar_dui(documento)
+        if not ok_d:
+            return False, msg_d
+
+    if nit:
+        ok_n, msg_n = _validar_nit(nit)
+        if not ok_n:
+            return False, msg_n
+
+    if telefono and telefono.strip():
+        ok_t, msg_t = _validar_telefono(telefono.strip())
+        if not ok_t:
+            return False, msg_t
+
+    if fecha_nacimiento and fecha_nacimiento.strip():
+        ok_f, msg_f = _validar_fecha_nacimiento(fecha_nacimiento.strip())
+        if not ok_f:
+            return False, msg_f
 
     cliente = Cliente(
         nombre=nombre,
@@ -135,7 +201,8 @@ def crear_cliente(session, nombre, tipo, saldo_inicial,
 
     try:
         session.commit()
-        return True, f"Cliente '{nombre}' creado — Cuenta: {cliente.num_cuenta}"
+        session.refresh(cliente)
+        return True, cliente
     except Exception as e:
         session.rollback()
         return False, f"Error: {str(e)}"
@@ -153,9 +220,10 @@ def editar_cliente(session, cliente_id, **kwargs):
         return False, "No se puede editar una cuenta cerrada"
 
     campos_permitidos = {
-        "nombre", "tipo", "documento", "tipo_documento",
-        "telefono", "email", "direccion", "fecha_nacimiento",
+    "nombre", "tipo", "tipo_cuenta_id", "documento", "tipo_documento",
+    "telefono", "email", "direccion", "fecha_nacimiento",
     }
+    
     for campo, valor in kwargs.items():
         if campo not in campos_permitidos:
             continue
@@ -175,9 +243,22 @@ def editar_cliente(session, cliente_id, **kwargs):
             if dup:
                 return False, "Ese documento ya está registrado en otra cuenta"
         if campo == "email" and valor:
+            ok_e, msg_e = _validar_email(valor)
+            if not ok_e:
+                return False, msg_e
             valor = valor.lower()
-            if "@" not in valor or "." not in valor.split("@")[-1]:
-                return False, "El formato del email no es válido"
+        if campo == "documento" and valor and kwargs.get("tipo_documento", cliente.tipo_documento) == "DUI":
+            ok_d, msg_d = _validar_dui(valor)
+            if not ok_d:
+                return False, msg_d
+        if campo == "telefono" and valor:
+            ok_t, msg_t = _validar_telefono(valor)
+            if not ok_t:
+                return False, msg_t
+        if campo == "fecha_nacimiento" and valor:
+            ok_f, msg_f = _validar_fecha_nacimiento(valor)
+            if not ok_f:
+                return False, msg_f
         setattr(cliente, campo, valor)
 
     cliente.actualizado_en = _dt.utcnow()
@@ -302,8 +383,7 @@ def depositar(session, cliente_id, monto):
     descripcion=f"Depósito cliente ID {cliente_id}",
     )
     _set_saldo(session, cliente_id, money(cliente.saldo) + neto)
-    _mov(session, cliente_id, "Deposito", money(neto),
-         f"Depósito (bruto ${money(bruto):.2f}, comisión ${money(comision):.2f})")
+    _mov( session,cliente_id,"Deposito",money(bruto),f"Depósito (bruto ${money(bruto):.2f}, comisión ${money(comision):.2f})")
     try:
         session.commit()
         return True, f"Depositado ${money(neto):.2f} (comisión ${money(comision):.2f})"
@@ -329,7 +409,7 @@ def retirar(session, cliente_id, monto):
         return False, f"Cuenta {cliente.estado.lower()} — operación no permitida"
     monto = money(monto)
     if monto < MIN_TRANSACCION:
-        return False, "El monto debe ser mayor a cero"
+        return False, f"El monto mínimo de retiro es ${MIN_TRANSACCION}"
     if monto > cliente.saldo:
         return False, f"Saldo insuficiente (disponible: ${cliente.saldo:,.2f})"
 
@@ -381,7 +461,7 @@ def transferir(session, origen_id, destino_id, monto):
         return False, "La cuenta destino está suspendida — no puede recibir fondos"
     monto = money(monto)
     if money(monto) < MIN_TRANSACCION:
-        return False, "El monto debe ser mayor a cero"
+        return False, f"El monto mínimo de transferencia es ${MIN_TRANSACCION}"
 
     comision = money(monto * tasa_transferencia(session))
     total    = money(monto + comision)
@@ -533,10 +613,11 @@ def otorgar_prestamo(session, cliente_id, monto, plazo_meses):
     _set_saldo(session, cliente_id, cliente.saldo + monto)
     _mov(session, cliente_id, "Prestamo", monto,
          f"Préstamo recibido (interés total: ${interes:.2f})")
+    
     try:
         session.commit()
-        return True, (f"Préstamo de ${monto:,.2f} otorgado "
-                      f"(interés ${interes:.2f} — deuda total ${monto+interes:,.2f})")
+        session.refresh(p)
+        return True, p
     except Exception as e:
         session.rollback()
         return False, f"Error al otorgar préstamo: {str(e)}"
@@ -715,19 +796,21 @@ def revertir_operacion(session, movimiento_id, motivo=""):
         return False, (f"El tipo '{mov.tipo}' no es reversible. "
                        f"Solo se pueden revertir: {', '.join(OPERACIONES_REVERSIBLES)}.")
 
-    limite = datetime.utcnow() - timedelta(minutes=VENTANA_REVERSION_MIN)
-    if mov.fecha < limite:
-        return False, (f"Solo se pueden revertir operaciones de los últimos "
-                       f"{VENTANA_REVERSION_MIN} minutos.")
-
-    # Verificar que no haya sido revertido ya
+    # Verificar primero si ya fue revertido
     ya_revertido = session.query(Movimiento).filter(
         Movimiento.tipo == "Reverso",
         Movimiento.descripcion.like(f"REVERSO mov#{movimiento_id}%"),
         Movimiento.cliente_id == mov.cliente_id,
     ).first()
+
     if ya_revertido:
         return False, "Esta operación ya fue revertida anteriormente."
+
+    limite = datetime.utcnow() - timedelta(minutes=VENTANA_REVERSION_MIN)
+
+    if mov.fecha < limite:
+        return False, (f"Solo se pueden revertir operaciones de los últimos "
+                       f"{VENTANA_REVERSION_MIN} minutos.")
 
     cliente = _get_cliente(session, mov.cliente_id)
     if not cliente:
@@ -737,19 +820,21 @@ def revertir_operacion(session, movimiento_id, motivo=""):
 
     try:
         if mov.tipo == "Deposito":
-            # El depósito original acreditó neto al cliente y tomó comisión.
-            # La reversión devuelve exactamente el neto al banco.
-            if monto > cliente.saldo:
+            # El depósito original acreditó el neto (bruto - comisión) al cliente.
+            # La reversión debe quitar solo el neto acreditado, no el bruto.
+            comision_dep = money(monto * tasa_deposito(session))
+            neto_dep     = money(monto - comision_dep)
+            if neto_dep > cliente.saldo:
                 return False, (f"Saldo insuficiente para revertir "
                                f"(cliente tiene ${cliente.saldo:,.2f}, "
-                               f"reversión requiere ${monto:,.2f}).")
+                               f"reversión requiere ${neto_dep:,.2f}).")
             registrar(
                 session,
-                debitos=[(  "Depositos Clientes", monto)],
-                creditos=[( "Caja General",        monto)],
+                debitos=[(  "Depositos Clientes", neto_dep)],
+                creditos=[( "Caja General",        neto_dep)],
                 descripcion=f"Reverso depósito mov#{movimiento_id}",
             )
-            _set_saldo(session, cliente.id, cliente.saldo - monto)
+            _set_saldo(session, cliente.id, cliente.saldo - neto_dep)
 
         elif mov.tipo == "Retiro":
             registrar(
@@ -790,9 +875,11 @@ def revertir_operacion(session, movimiento_id, motivo=""):
         _mov(session, cliente.id, "Reverso", monto,
              f"REVERSO mov#{movimiento_id} — {motivo or 'Reversión administrativa'}")
         session.commit()
+        
         return True, f"Operación #{movimiento_id} revertida correctamente."
 
-    except Exception as e:
+    except Exception as e:    
+        print("ERROR REVERSION:", e)
         session.rollback()
         return False, f"Error al revertir: {str(e)}"
 

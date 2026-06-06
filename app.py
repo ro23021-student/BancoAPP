@@ -7,8 +7,6 @@ Arquitectura:
   app.py           → UI Streamlit
 """
 
-from sys import audit
-
 import streamlit as st
 import random
 from decimal import Decimal
@@ -54,6 +52,8 @@ from auth import (
     crear_usuario, cambiar_password, toggle_usuario, cambiar_rol,
     registrar_log, tiene_permiso, MENU_POR_ROL, ROL_COLOR,
 )
+# alias: audit() calls in vista_operaciones deben registrar en el log
+audit = registrar_log
 from exportar import (
     generar_estado_cuenta_pdf, generar_comprobante_pdf,
     generar_amortizacion_pdf, generar_movimientos_csv,
@@ -550,7 +550,11 @@ def vista_clientes(session, usuario):
                         ingresos_mensuales=ingresos,
                         tipo_cuenta_id=tc_id, sucursal_id=suc_id,
                     )
-                    alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
+                    if ok:
+                        msg_str = f"Cliente '{msg.nombre}' creado — cuenta {msg.num_cuenta}"
+                    else:
+                        msg_str = msg
+                    alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg_str)
                     if ok:
                         st.rerun()
 
@@ -576,10 +580,16 @@ def vista_clientes(session, usuario):
                         col1, col2 = st.columns(2)
                         with col1:
                             nuevo_nombre = st.text_input("Nombre completo", value=sel_e.nombre or "")
-                            nuevo_tipo   = st.selectbox(
+                            tipos_cuenta_edit = session.query(TipoCuenta).filter_by(activo=True).order_by(TipoCuenta.nombre).all()
+                            tc_nombres_edit   = [tc.nombre for tc in tipos_cuenta_edit]
+                            tipo_actual = sel_e.tipo or ""
+                            tc_idx_actual     = tc_nombres_edit.index(tipo_actual) if tipo_actual in tc_nombres_edit else 0
+                            nuevo_tipo_idx = st.selectbox(
                                 "Tipo de cuenta",
-                                ["ahorro", "corriente"],
-                                index=0 if sel_e.tipo == "ahorro" else 1,
+                                range(len(tc_nombres_edit)),
+                                index=tc_idx_actual,
+                                format_func=lambda i: tc_nombres_edit[i],
+                                key=f"edit_tipo_cuenta_{sel_e.id}",  # <-- key único por cliente
                             )
                             nuevo_tipo_doc = st.selectbox(
                                 "Tipo documento",
@@ -600,7 +610,8 @@ def vista_clientes(session, usuario):
                         ok, msg = editar_cliente(
                             session, sel_e.id,
                             nombre=nuevo_nombre,
-                            tipo=nuevo_tipo,
+                            tipo=tc_nombres_edit[nuevo_tipo_idx],
+                            tipo_cuenta_id=tipos_cuenta_edit[nuevo_tipo_idx].id,
                             tipo_documento=nuevo_tipo_doc,
                             documento=nuevo_doc,
                             fecha_nacimiento=nueva_fecha,
@@ -891,7 +902,7 @@ def vista_operaciones(session):
         with st.form("deposito_form"):
             sel   = st.selectbox("Cliente", clientes,
                                  format_func=lambda c: f"[{c.num_cuenta}] {c.nombre}  —  ${c.saldo:,.2f}")
-            monto = st.number_input("Monto bruto ($)", min_value=0.01, step=100.0,
+            monto = st.number_input("Monto bruto ($)", min_value=1.0, value=100.0, step=100.0,
                                     max_value=500_000.0)
             st.info(
                 f"💡  Neto al cliente: **${float(monto)*0.98:,.2f}**  ·  "
@@ -930,15 +941,24 @@ def vista_operaciones(session):
         else:
             with st.form("retiro_form"):
                 monto   = st.number_input("Monto a retirar ($)",
-                                          min_value=0.01, max_value=float(sel.saldo), step=100.0)
+                                          min_value=1.0, value=min(100.0, float(sel.saldo)),
+                                          step=10.0)
                 enviado = st.form_submit_button("🏧 Realizar retiro", type="primary")
             if enviado:
-                ok, msg = retirar(session, sel.id, monto)
-                audit(session, usuario_activo, "RETIRO",
-                      f"Cliente {sel.nombre} ({sel.num_cuenta}) — ${monto:,.2f}",
-                      "OK" if ok else "ERROR")
-                alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
-                if ok: st.rerun()
+                # Recargar saldo fresco desde BD para evitar datos desactualizados
+                cliente_fresco = session.query(__import__('models', fromlist=['Cliente']).Cliente).filter_by(id=sel.id).first()
+                saldo_actual = float(cliente_fresco.saldo) if cliente_fresco else 0.0
+                if monto <= 0:
+                    alert("error", "✗ El monto a retirar debe ser mayor a cero.")
+                elif monto > saldo_actual:
+                    alert("error", f"✗ Saldo insuficiente — disponible: ${saldo_actual:,.2f}, solicitado: ${monto:,.2f}.")
+                else:
+                    ok, msg = retirar(session, sel.id, monto)
+                    audit(session, usuario_activo, "RETIRO",
+                          f"Cliente {sel.nombre} ({sel.num_cuenta}) — ${monto:,.2f}",
+                          "OK" if ok else "ERROR")
+                    alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
+                    if ok: st.rerun()
 
     # ── Transferencia ──
     elif "Transferencia" in operacion:
@@ -975,7 +995,7 @@ def vista_operaciones(session):
                 else:
                     destino = destino_cliente
                     st.markdown(f"**Destino (beneficiario):** {benef_sel.alias} `{benef_sel.cuenta_destino}`")
-            monto = st.number_input("Monto a transferir ($)", min_value=0.01,
+            monto = st.number_input("Monto a transferir ($)", min_value=1.0, value=100.0,
                                     step=100.0, max_value=500_000.0)
             st.info(
                 f"💡  Destino recibe: **${float(monto):,.2f}**  ·  "
@@ -1118,7 +1138,11 @@ def vista_prestamos(session):
                             if suc_sel:
                                 ultimo_p.sucursal_id = suc_sel.id
                             session.commit()
-                    alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
+                    if ok:
+                        msg_str = f"Préstamo #{msg.id} de ${msg.monto:,.2f} otorgado a {plazo} meses"
+                    else:
+                        msg_str = msg
+                    alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg_str)
                     if ok: st.rerun()
 
     # ── Pagar ──
@@ -1607,6 +1631,455 @@ def vista_reconciliacion(session):
 # ─────────────────────────────
 # STRESS TEST (modo desarrollo)
 # ─────────────────────────────
+
+def ejecutar_diagnostico_completo(session):
+    import time
+    from decimal import Decimal
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session as SASession
+    import sys, os, random, string as string_mod
+
+    sys.path.insert(0, os.path.dirname(__file__))
+
+    resultados = []
+
+    def check(nombre, fn):
+        t0 = time.time()
+        try:
+            ok, detalle = fn()
+            ms = int((time.time() - t0) * 1000)
+            resultados.append({"nombre": nombre, "ok": ok, "detalle": detalle, "ms": ms})
+        except Exception as e:
+            ms = int((time.time() - t0) * 1000)
+            resultados.append({"nombre": nombre, "ok": False, "detalle": str(e), "ms": ms})
+
+    # ── Sesión de prueba en memoria ──
+    from models import BaseLocal, Cliente, Movimiento, Prestamo, AlertaAML, CierreDiario, TarjetaDebito, TarjetaCredito, DepositoPlazoFijo, Socio
+    from contabilidad import inicializar_contabilidad, caja_real, reconciliar
+    from operaciones import crear_cliente, depositar, retirar, transferir, otorgar_prestamo, pagar_prestamo, revertir_operacion, suspender_cliente, reactivar_cliente, cerrar_cuenta
+    from extras import (emitir_tarjeta_debito, emitir_tarjeta_credito, calcular_score,
+                        crear_deposito_plazo, vencer_deposito_plazo, realizar_cierre_diario,
+                        generar_balance_general, generar_estado_resultados,
+                        registrar_socio, registrar_aporte, verificar_aml,
+                        agregar_beneficiario, eliminar_beneficiario,
+                        inicializar_tipos_cuenta, inicializar_sucursales,
+                        agregar_garantia, refinanciar_prestamo,
+                        historial_cliente, actualizar_cuotas_vencidas)
+    from exportar import generar_estado_cuenta_pdf, generar_movimientos_csv, generar_balance_pdf, generar_balance_csv
+    from alertas import obtener_todas_alertas, verificar_saldos_bajos
+
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    BaseLocal.metadata.create_all(eng)
+    s = SASession(eng)
+    inicializar_contabilidad(s)
+    inicializar_tipos_cuenta(s)
+    inicializar_sucursales(s)
+    s.commit()
+    _, ca = crear_cliente(s, "Test A", "Ahorro", 5000); s.commit()
+    _, cb = crear_cliente(s, "Test B", "Ahorro", 3000); s.commit()
+    _, cr = crear_cliente(s, "Test Rico", "Ahorro", 50000); s.commit()
+
+    # ── 1. Concurrencia: num_trx único bajo carga ──
+    def t_trx_unico():
+        nums = set()
+        for _ in range(200):
+            depositar(s, ca.id, 10)
+            s.commit()
+        movs = s.query(Movimiento).all()
+        trxs = [m.num_trx for m in movs]
+        dupes = len(trxs) - len(set(trxs))
+        if dupes > 0:
+            return False, f"{dupes} num_trx duplicados detectados"
+        return True, f"{len(trxs)} transacciones con num_trx únicos"
+    check("num_trx único bajo 200 operaciones", t_trx_unico)
+
+    # ── 2. Zona horaria consistente ──
+    def t_timezone():
+        from datetime import datetime, timezone
+        _, dep = depositar(s, ca.id, 100); s.commit()
+        mov = s.query(Movimiento).order_by(Movimiento.id.desc()).first()
+        ahora_utc = datetime.utcnow()
+        diff_seg = abs((ahora_utc - mov.fecha).total_seconds())
+        if diff_seg > 60:
+            return False, f"Desfase de {diff_seg:.0f}s — fechas no están en UTC"
+        return True, f"Desfase de {diff_seg:.1f}s (< 60s) — UTC consistente"
+    check("Zona horaria UTC consistente", t_timezone)
+
+    # ── 3. num_certificado DPF único ──
+    def t_dpf_cert():
+        certs = []
+        for _ in range(30):
+            ok, dpf = crear_deposito_plazo(s, cr.id, 500, Decimal("0.05"), 3)
+            if ok:
+                certs.append(dpf.num_certificado)
+        dupes = len(certs) - len(set(certs))
+        if dupes > 0:
+            return False, f"{dupes} num_certificado DPF duplicados"
+        return True, f"{len(certs)} certificados DPF con IDs únicos"
+    check("num_certificado DPF único (30 creaciones)", t_dpf_cert)
+
+    # ── 4. Exportación PDF estado de cuenta ──
+    def t_pdf_estado():
+        movs = s.query(Movimiento).filter_by(cliente_id=ca.id).limit(10).all()
+        pdf = generar_estado_cuenta_pdf(ca, movs)
+        if not pdf or pdf[:4] != b"%PDF":
+            return False, "PDF inválido o vacío"
+        return True, f"PDF generado correctamente ({len(pdf):,} bytes)"
+    check("Exportación PDF estado de cuenta", t_pdf_estado)
+
+    # ── 5. Exportación CSV movimientos ──
+    def t_csv_mov():
+        movs = s.query(Movimiento).filter_by(cliente_id=ca.id).limit(10).all()
+        csv_b = generar_movimientos_csv(movs, ca)
+        if not csv_b or b"Fecha" not in csv_b:
+            return False, "CSV inválido — sin cabecera"
+        filas = csv_b.decode("utf-8", errors="replace").strip().split("\n")
+        return True, f"CSV con {len(filas)-1} filas de movimientos"
+    check("Exportación CSV movimientos", t_csv_mov)
+
+    # ── 6. Exportación PDF balance ──
+    def t_pdf_bal():
+        cuentas = [{"nombre": "Caja", "categoria": "ACTIVO", "saldo": float(caja_real(s))},
+                   {"nombre": "Capital", "categoria": "PATRIMONIO", "saldo": 1000.0}]
+        pdf = generar_balance_pdf(cuentas)
+        if not pdf or pdf[:4] != b"%PDF":
+            return False, "Balance PDF inválido"
+        return True, f"Balance PDF generado ({len(pdf):,} bytes)"
+    check("Exportación PDF balance general", t_pdf_bal)
+
+    # ── 7. Exportación CSV balance ──
+    def t_csv_bal():
+        cuentas = [{"nombre": "Caja", "categoria": "ACTIVO", "saldo": float(caja_real(s))},
+                   {"nombre": "Capital", "categoria": "PATRIMONIO", "saldo": 1000.0}]
+        csv_b = generar_balance_csv(cuentas)
+        if not csv_b or b"Caja" not in csv_b:
+            return False, "Balance CSV inválido"
+        return True, f"Balance CSV generado ({len(csv_b)} bytes)"
+    check("Exportación CSV balance general", t_csv_bal)
+
+    # ── 8. Saldo nunca negativo ──
+    def t_saldo_negativo():
+        s.refresh(ca)
+        for _ in range(50):
+            retirar(s, ca.id, 9999)
+            s.commit()
+        s.refresh(ca)
+        if float(ca.saldo) < 0:
+            return False, f"Saldo negativo detectado: ${ca.saldo:,.2f}"
+        return True, f"Saldo protegido contra negativos: ${ca.saldo:,.2f}"
+    check("Saldo nunca cae a negativo", t_saldo_negativo)
+
+    # ── 9. Partida doble (balance cuadrado) ──
+    def t_balance_cuadrado():
+        errores, lines = reconciliar(s)
+        if errores:
+            fallos = [l for l in lines if "❌" in l]
+            return False, " | ".join(fallos[:2])
+        return True, "Activos = Pasivos + Patrimonio"
+    check("Partida doble — balance cuadrado", t_balance_cuadrado)
+
+    # ── 10. Caja real coherente ──
+    def t_caja():
+        caja_antes = caja_real(s)
+        depositar(s, ca.id, 777); s.commit()
+        caja_despues = caja_real(s)
+        diff = float(caja_despues) - float(caja_antes)
+        if diff < 700:
+            return False, f"Caja no aumentó correctamente (diff: ${diff:,.2f})"
+        return True, f"Caja subió ${diff:,.2f} tras depósito de $777"
+    check("Caja real coherente tras depósito", t_caja)
+
+    # ── 11. AML monto alto ──
+    def t_aml_monto():
+        alertas = verificar_aml(s, ca.id, 15000, "deposito")
+        tipos = [a.tipo for a in alertas]
+        if "MONTO_ALTO" not in tipos:
+            return False, "No generó alerta MONTO_ALTO para $15,000"
+        return True, "Alerta MONTO_ALTO generada correctamente"
+    check("AML — alerta por monto alto ($15,000)", t_aml_monto)
+
+    # ── 12. AML múltiples transferencias ──
+    def t_aml_mult():
+        depositar(s, cr.id, 20000); s.commit()
+        for _ in range(5):
+            transferir(s, cr.id, cb.id, 100); s.commit()
+        alertas = verificar_aml(s, cr.id, 100, "transferencia")
+        tipos = [a.tipo for a in alertas]
+        if "MULT_TRANSFERENCIAS" not in tipos:
+            return False, "No detectó múltiples transferencias"
+        return True, "Alerta MULT_TRANSFERENCIAS generada correctamente"
+    check("AML — múltiples transferencias en el día", t_aml_mult)
+
+    # ── 13. Score crediticio ──
+    def t_score():
+        sc = calcular_score(s, cr.id)
+        if sc is None:
+            return False, "calcular_score retornó None"
+        score = sc.score
+        if score < 300 or score > 850:
+            return False, f"Score fuera de rango: {score}"
+        return True, f"Score calculado: {score} — categoría: {sc.categoria}"
+    check("Score crediticio en rango válido", t_score)
+
+    # ── 14. Tarjeta débito ──
+    def t_tarjeta_debito():
+        ok, td = emitir_tarjeta_debito(s, cb.id)
+        if not ok:
+            return False, str(td)
+        if not td.cvv or len(str(td.cvv)) != 3:
+            return False, "CVV inválido"
+        return True, f"Tarjeta débito emitida con CVV de 3 dígitos"
+    check("Emisión tarjeta débito con CVV", t_tarjeta_debito)
+
+    # ── 15. Tarjeta crédito con score alto ──
+    def t_tarjeta_credito():
+        calcular_score(s, cr.id); s.commit()
+        ok, tc = emitir_tarjeta_credito(s, cr.id, 5000)
+        if not ok:
+            return False, str(tc)
+        return True, f"Tarjeta crédito emitida — límite ${tc.limite:,.2f}"
+    check("Emisión tarjeta crédito (score alto)", t_tarjeta_credito)
+
+    # ── 16. Depósito a plazo fijo — flujo completo ──
+    def t_dpf_flujo():
+        s.refresh(cr)
+        saldo_antes = float(cr.saldo)
+        ok, dpf = crear_deposito_plazo(s, cr.id, 1000, Decimal("0.05"), 6); s.commit()
+        if not ok:
+            return False, f"No se pudo crear DPF: {dpf}"
+        ok2, msg2 = vencer_deposito_plazo(s, dpf.id, "Test"); s.commit()
+        if not ok2:
+            return False, f"No se pudo vencer DPF: {msg2}"
+        s.refresh(cr)
+        interes = float(cr.saldo) - saldo_antes
+        if interes <= 0:
+            return False, "No se acreditó interés al vencer el DPF"
+        return True, f"DPF flujo OK — interés acreditado: ${interes:,.2f}"
+    check("Depósito a plazo fijo — crear y vencer", t_dpf_flujo)
+
+    # ── 17. Socios y aportes ──
+    def t_socios():
+        ok, socio = registrar_socio(s, cb.id, 200); s.commit()
+        if not ok:
+            return False, str(socio)
+        ok2, msg2 = registrar_aporte(s, socio.id, 100, "EXTRAORDINARIO"); s.commit()
+        if not ok2:
+            return False, str(msg2)
+        s.refresh(socio)
+        if float(socio.aporte_total) < 300:
+            return False, f"Total aportado incorrecto: ${socio.aporte_total}"
+        return True, f"Socio registrado — total aportado: ${socio.aporte_total:,.2f}"
+    check("Socios — registro y acumulación de aportes", t_socios)
+
+    # ── 18. Historial cliente ──
+    def t_historial():
+        hist = historial_cliente(s, ca.id)
+        if hist is None:
+            return False, "historial_cliente retornó None"
+        if "movimientos" not in hist:
+            return False, "Historial sin clave 'movimientos'"
+        return True, f"Historial con {len(hist['movimientos'])} movimientos"
+    check("Historial cliente — estructura correcta", t_historial)
+
+    # ── 19. Reversión de depósito ──
+    def t_reversion():
+        depositar(s, ca.id, 500); s.commit()
+        mov = s.query(Movimiento).filter_by(cliente_id=ca.id, tipo="Deposito").order_by(Movimiento.id.desc()).first()
+        s.refresh(ca)
+        saldo_antes = float(ca.saldo)
+        ok, msg = revertir_operacion(s, mov.id, "Test"); s.commit()
+        if not ok:
+            return False, msg
+        s.refresh(ca)
+        diff = abs(float(ca.saldo) - (saldo_antes - 490))
+        if diff > 1:
+            return False, f"Saldo tras reversión incorrecto: ${ca.saldo:,.2f}"
+        return True, f"Reversión OK — saldo ajustado correctamente"
+    check("Reversión de depósito reciente", t_reversion)
+
+    # ── 20. Suspender y reactivar cuenta ──
+    def t_suspender():
+        _, cs = crear_cliente(s, "Test Suspend", "Ahorro", 100); s.commit()
+        ok1, _ = suspender_cliente(s, cs.id, "Test"); s.commit()
+        ok2, _ = depositar(s, cs.id, 50)
+        ok3, _ = reactivar_cliente(s, cs.id); s.commit()
+        ok4, _ = depositar(s, cs.id, 50); s.commit()
+        if not ok1:
+            return False, "No se pudo suspender"
+        if ok2:
+            return False, "Depósito aceptado en cuenta suspendida"
+        if not ok3:
+            return False, "No se pudo reactivar"
+        if not ok4:
+            return False, "Depósito rechazado tras reactivación"
+        return True, "Suspender/reactivar funciona correctamente"
+    check("Suspender y reactivar cuenta", t_suspender)
+
+    # ── 21. Límites diarios ──
+    def t_limites():
+        _, cl = crear_cliente(s, "Test Limites", "Ahorro", 100000); s.commit()
+        depositar(s, cl.id, 50000); s.commit()
+        ok_ok, _ = retirar(s, cl.id, 100); s.commit()
+        ok_fail, _ = retirar(s, cl.id, 99000)
+        if not ok_ok:
+            return False, "Retiro válido rechazado"
+        if ok_fail:
+            return False, "Retiro que supera límite fue aceptado"
+        return True, "Límites diarios funcionan correctamente"
+    check("Límites diarios de retiro", t_limites)
+
+    # ── 22. Beneficiarios ──
+    def t_beneficiarios():
+        ok, b = agregar_beneficiario(s, ca.id, cb.num_cuenta, "Test B")
+        if not ok:
+            return False, str(b)
+        ok2, msg2 = eliminar_beneficiario(s, b.id, ca.id)
+        if not ok2:
+            return False, str(msg2)
+        return True, "Agregar y eliminar beneficiario OK"
+    check("Beneficiarios — agregar y eliminar", t_beneficiarios)
+
+    # ── 23. Cierre diario con totales ──
+    def t_cierre():
+        depositar(s, ca.id, 300); s.commit()
+        ok, cierre = realizar_cierre_diario(s, "DiagAdmin", "Test diagnóstico")
+        if not ok:
+            return False, str(cierre)
+        if float(cierre.total_depositos) < 300:
+            return False, f"total_depositos={cierre.total_depositos} — esperaba >= 300"
+        return True, f"Cierre OK — depósitos: ${cierre.total_depositos:,.2f}"
+    check("Cierre diario — registra totales correctos", t_cierre)
+
+    # ── 24. Balance general estructura ──
+    def t_balance_estructura():
+        bal = generar_balance_general(s)
+        if not bal or "activos" not in bal or "pasivos" not in bal:
+            return False, "Balance sin claves 'activos' o 'pasivos'"
+        return True, f"Balance con {len(bal.get('activos',[]))} activos, {len(bal.get('pasivos',[]))} pasivos"
+    check("Balance general — estructura correcta", t_balance_estructura)
+
+    # ── 25. Estado de resultados ──
+    def t_estado_res():
+        er = generar_estado_resultados(s)
+        if not er or "ingresos" not in er:
+            return False, "Estado de resultados sin clave 'ingresos'"
+        return True, f"Estado de resultados OK — ingresos: ${er.get('total_ingresos', 0):,.2f}"
+    check("Estado de resultados — estructura correcta", t_estado_res)
+
+    s.close()
+
+    # ── Renderizar resultados ──
+    total = len(resultados)
+    pasaron = sum(1 for r in resultados if r["ok"])
+    fallaron = total - pasaron
+
+    st.subheader("🔬 Diagnóstico integral del sistema")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Checks totales", total)
+    col2.metric("✅ Pasaron", pasaron)
+    col3.metric("❌ Fallaron", fallaron)
+    col4.metric("Cobertura", f"{int(pasaron/total*100)}%")
+
+    if fallaron == 0:
+        st.success("🎉 Todos los checks pasaron — sistema funcionando correctamente")
+        st.balloons()
+    else:
+        st.warning(f"⚠️ {fallaron} check(s) con problemas — revisa los detalles abajo")
+
+    st.divider()
+
+    CATEGORIAS = [
+        ("🔒 Integridad de datos", [0,1,2]),
+        ("📄 Exportaciones", [3,4,5,6]),
+        ("💰 Operaciones bancarias", [7,8,9]),
+        ("🚨 AML & Score", [10,11,12]),
+        ("💳 Tarjetas & DPF", [13,14,15]),
+        ("🤝 Socios & Historial", [16,17]),
+        ("↩️ Reversiones & Control", [18,19,20]),
+        ("📊 Reportes & Cierre", [21,22,23,24]),
+    ]
+
+    for cat_nombre, indices in CATEGORIAS:
+        cat_results = [resultados[i] for i in indices if i < len(resultados)]
+        cat_ok = all(r["ok"] for r in cat_results)
+        icon = "✅" if cat_ok else "❌"
+        with st.expander(f"{icon} {cat_nombre} — {sum(r['ok'] for r in cat_results)}/{len(cat_results)}"):
+            for r in cat_results:
+                if r["ok"]:
+                    st.success(f"✅ **{r['nombre']}** — {r['detalle']} *({r['ms']}ms)*")
+                else:
+                    st.error(f"❌ **{r['nombre']}** — {r['detalle']} *({r['ms']}ms)*")
+
+
+def ejecutar_pytest_ui():
+    import subprocess, sys, re, os
+    st.subheader("🧪 Resultados de pytest")
+
+    test_path = os.path.join(os.path.dirname(__file__), "tests", "test_banco.py")
+    python_exec = sys.executable
+
+    with st.spinner("Ejecutando 101 tests..."):
+        result = subprocess.run(
+            [python_exec, "-m", "pytest", test_path, "-v", "--tb=short", "--no-header"],
+            capture_output=True, text=True, timeout=120
+        )
+
+    output = result.stdout + result.stderr
+    lines = output.splitlines()
+
+    passed = failed = 0
+    suite_data = {}
+    errors = []
+    current_fail = None
+
+    for line in lines:
+        m = re.match(r"tests/test_banco\.py::(\w+)::(\w+) (PASSED|FAILED)", line)
+        if m:
+            cls, test, status = m.group(1), m.group(2), m.group(3)
+            suite_data.setdefault(cls, {"pass": 0, "fail": 0})
+            if status == "PASSED":
+                suite_data[cls]["pass"] += 1
+                passed += 1
+            else:
+                suite_data[cls]["fail"] += 1
+                failed += 1
+        if "FAILED" in line and "::" in line:
+            current_fail = line.strip()
+        if current_fail and line.strip().startswith("E "):
+            errors.append((current_fail, line.strip()[2:]))
+            current_fail = None
+
+    total = passed + failed
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total", total)
+    col2.metric("✅ Pasaron", passed, delta=None)
+    col3.metric("❌ Fallaron", failed, delta=None)
+
+    if failed == 0:
+        st.success(f"🎉 Todos los tests pasaron ({passed}/{total})")
+    else:
+        st.warning(f"⚠️ {failed} test(s) fallaron de {total}")
+
+    st.divider()
+    for cls, counts in suite_data.items():
+        total_c = counts["pass"] + counts["fail"]
+        icon = "✅" if counts["fail"] == 0 else "❌"
+        label = f"{icon} {cls}  —  {counts['pass']}/{total_c}"
+        color = "normal" if counts["fail"] == 0 else "inverse"
+        st.progress(counts["pass"] / total_c if total_c else 0, text=label)
+
+    if errors:
+        st.divider()
+        st.subheader("Errores encontrados")
+        for test_name, err_msg in errors:
+            with st.expander(f"❌ {test_name}"):
+                st.code(err_msg, language="python")
+
+    with st.expander("📋 Output completo"):
+        st.code(output, language="bash")
+
+
 def ejecutar_stress_test(session):
     clientes = session.query(Cliente).all()
     if len(clientes) < 2:
@@ -2526,20 +2999,48 @@ def vista_plazo_fijo(session, usuario):
             st.dataframe(pd.DataFrame(data), use_container_width=True)
 
             if tiene_permiso(usuario, "gestionar_plazo_fijo"):
-                vencidos = [d for d in depositos if d.estado == "ACTIVO" and
-                            d.fecha_vencimiento and d.fecha_vencimiento <= hoy]
+                activos = [d for d in depositos if d.estado == "ACTIVO"]
+                vencidos = [d for d in activos if d.fecha_vencimiento and d.fecha_vencimiento <= hoy]
+
                 if vencidos:
                     st.warning(f"⚠️ {len(vencidos)} depósito(s) vencido(s) pendientes de pago.")
-                    dpf_sel = st.selectbox("Pagar vencimiento", vencidos,
-                                           format_func=lambda d: f"{d.num_certificado} — ${float(d.monto_total):,.2f}")
-                    if st.button("💰 Pagar al cliente", type="primary"):
-                        ok, result = vencer_deposito_plazo(session, dpf_sel.id, usuario.username)
-                        if ok:
-                            session.commit()
-                            st.success(f"✅ ${float(result.monto_total):,.2f} acreditados al cliente")
-                            st.rerun()
-                        else:
-                            st.error(result)
+
+                if activos:
+                    st.markdown("---")
+                    st.markdown("#### 💰 Liquidar Depósito a Plazo Fijo")
+                    dpf_sel = st.selectbox(
+                        "Seleccionar certificado a liquidar",
+                        activos,
+                        format_func=lambda d: (
+                            f"{d.num_certificado} — ${float(d.monto_total):,.2f} "
+                            f"({'VENCIDO' if d.fecha_vencimiento and d.fecha_vencimiento <= hoy else f'vence {d.fecha_vencimiento}'})"
+                        ),
+                        key="dpf_liquidar_sel"
+                    )
+                    if dpf_sel:
+                        es_vencido = dpf_sel.fecha_vencimiento and dpf_sel.fecha_vencimiento <= hoy
+                        cliente_dpf = session.query(Cliente).filter_by(id=dpf_sel.cliente_id).first()
+                        col_ia, col_ib = st.columns(2)
+                        with col_ia:
+                            st.info(
+                                f"**Cliente:** {cliente_dpf.nombre if cliente_dpf else '—'}  \n"
+                                f"**Capital:** ${float(dpf_sel.monto):,.2f}  \n"
+                                f"**Interés proyectado:** ${float(dpf_sel.interes_proyectado):,.2f}  \n"
+                                f"**Total a pagar:** ${float(dpf_sel.monto_total):,.2f}  \n"
+                                f"**Estado:** {'✅ VENCIDO — listo para pagar' if es_vencido else '⏳ Vigente — liquidación anticipada'}"
+                            )
+                        with col_ib:
+                            if not es_vencido:
+                                st.warning("⚠️ Este certificado aún no ha vencido. Al liquidarlo anticipadamente el cliente recibirá el capital + intereses completos.")
+                            lbl = "💰 Pagar al cliente (vencido)" if es_vencido else "💰 Liquidar anticipadamente"
+                            if st.button(lbl, type="primary", key="btn_liquidar_dpf"):
+                                ok, result = vencer_deposito_plazo(session, dpf_sel.id, usuario.username)
+                                if ok:
+                                    session.commit()
+                                    st.success(f"✅ ${float(result.monto_total):,.2f} acreditados al cliente exitosamente.")
+                                    st.rerun()
+                                else:
+                                    st.error(result)
         else:
             st.info("No hay depósitos a plazo fijo registrados.")
 
@@ -2885,6 +3386,20 @@ def main():
                             ejecutar_stress_test(dev_session)
                         finally:
                             dev_session.close()
+
+                    st.divider()
+                    st.caption("Corre la suite completa de pytest (101 tests).")
+                    if st.button("🧪 Correr Tests", type="secondary"):
+                        ejecutar_pytest_ui()
+
+                    st.divider()
+                    st.caption("25 checks de integridad, exportaciones, concurrencia y más.")
+                    if st.button("🔬 Diagnóstico integral", type="secondary"):
+                        dev_session2 = get_session()
+                        try:
+                            ejecutar_diagnostico_completo(dev_session2)
+                        finally:
+                            dev_session2.close()
 
         # ── Despacho de vistas con guardias de permiso ──
         if opcion == "📊 Panel principal":

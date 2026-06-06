@@ -1,65 +1,70 @@
 """
-test_banco.py — Suite completa de tests para BancoAppSistemas
-=============================================================
-Cubre los 5 módulos implementados:
-  1. operaciones.py  — depósito, retiro, transferencia, préstamo, pago
-  2. alertas.py      — saldo bajo, caja baja, préstamos vencidos, login fallido
-  3. exportar.py     — PDF estado de cuenta, CSV movimientos, amortización
-  4. contabilidad.py — partida doble, reconciliación
-  5. auth.py         — login, roles, permisos, usuarios
+test_banco_completo.py — Suite de tests COMPLEMENTARIA para BancoAppSistemas
+=============================================================================
+Cubre todos los módulos y funciones NO cubiertas por test_banco.py:
+
+  1.  extras.py — TipoCuenta, Sucursales, Beneficiarios
+  2.  extras.py — Depósito a Plazo Fijo (crear + vencer)
+  3.  extras.py — Garantías y Refinanciamiento
+  4.  extras.py — Score Crediticio
+  5.  extras.py — Tarjetas (débito y crédito)
+  6.  extras.py — AML (Anti-Lavado de Dinero)
+  7.  extras.py — Cierre Diario
+  8.  extras.py — Balance General y Estado de Resultados
+  9.  extras.py — Socios y Aportes
+  10. extras.py — Historial Cliente y Cuotas Vencidas
+  11. operaciones.py — Revertir Operación
+  12. operaciones.py — Límites Diarios
+  13. operaciones.py — Validaciones de campos (DUI, NIT, email, teléfono)
+  14. operaciones.py — Límite de préstamos simultáneos
+  15. contabilidad.py — Reconciliación y balance partida doble
+  16. Flujos de integración end-to-end
 
 CÓMO EJECUTAR:
-  pip install pytest sqlalchemy bcrypt reportlab
-  cd BancoAppSistemas
-  pytest tests/test_banco.py -v
-
-Para ver solo un módulo:
-  pytest tests/test_banco.py -v -k "test_deposito"
-  pytest tests/test_banco.py -v -k "alertas"
-  pytest tests/test_banco.py -v -k "exportar"
-
-Para ver el resumen sin verbose:
-  pytest tests/test_banco.py
+  cd BancoAppSistemas_fixed
+  pytest tests/test_banco_completo.py -v
+  pytest tests/ -v                        # ambas suites juntas
 """
 
 import pytest
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-# ── Importar módulos del banco ────────────────────────────────
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from models import (
     BaseLocal, Cliente, Movimiento, Prestamo, CuotaPrestamo,
     ConfigBanco, Usuario, AuditLog,
+    TipoCuenta, Beneficiario, DepositoPlazoFijo, Garantia,
+    ScoreCredito, TarjetaDebito, TarjetaCredito,
+    Sucursal, ATM, AlertaAML, CierreDiario,
+    Socio, AporteSocio,
 )
 from contabilidad import inicializar_contabilidad, saldo_cuenta, caja_real, reconciliar
 from operaciones import (
     crear_cliente, depositar, retirar, transferir,
-    otorgar_prestamo, pagar_prestamo, devengar_interes,
-    editar_cliente, suspender_cliente, reactivar_cliente, cerrar_cuenta,
-    tasa_deposito, tasa_transferencia, tasa_prestamo,
+    otorgar_prestamo, pagar_prestamo,
+    suspender_cliente, reactivar_cliente,
+    revertir_operacion, verificar_limite_diario,
+    OPERACIONES_REVERSIBLES, VENTANA_REVERSION_MIN,
 )
-from auth import (
-    login, crear_usuario, hash_password, tiene_permiso,
-    toggle_usuario, cambiar_rol, cambiar_password,
-    registrar_primer_admin, PERMISOS,
-)
-from alertas import (
-    verificar_saldos_bajos, verificar_caja_baja,
-    verificar_prestamos_por_vencer, verificar_prestamos_vencidos,
-    verificar_intentos_login, verificar_mora_activa,
-    calcular_mora, obtener_todas_alertas,
-    NIVEL_ERROR, NIVEL_WARNING,
-)
-from exportar import (
-    generar_estado_cuenta_pdf, generar_comprobante_pdf,
-    generar_amortizacion_pdf, generar_movimientos_csv,
-    generar_balance_csv, generar_balance_pdf,
+from extras import (
+    inicializar_tipos_cuenta, crear_tipo_cuenta,
+    inicializar_sucursales, crear_sucursal,
+    agregar_beneficiario, eliminar_beneficiario,
+    crear_deposito_plazo, vencer_deposito_plazo,
+    agregar_garantia, refinanciar_prestamo,
+    calcular_score,
+    emitir_tarjeta_debito, emitir_tarjeta_credito,
+    verificar_aml, obtener_alertas_aml, revisar_alerta_aml,
+    realizar_cierre_diario,
+    generar_balance_general, generar_estado_resultados,
+    registrar_socio, registrar_aporte,
+    historial_cliente, actualizar_cuotas_vencidas,
 )
 
 
@@ -83,826 +88,866 @@ def session():
 
 @pytest.fixture
 def cliente_a(session):
-    """Cliente A con $1000 de saldo inicial."""
-    ok, msg = crear_cliente(session, "Ana Garcia", "ahorro", 1000.0)
-    assert ok, f"No se pudo crear cliente A: {msg}"
-    return session.query(Cliente).filter_by(nombre="Ana Garcia").first()
+    ok, c = crear_cliente(session, "Ana López", "Ahorro", 1000)
+    session.commit()
+    return c
 
 
 @pytest.fixture
 def cliente_b(session):
-    """Cliente B con $500 de saldo inicial."""
-    ok, msg = crear_cliente(session, "Bob Torres", "corriente", 500.0)
-    assert ok, f"No se pudo crear cliente B: {msg}"
-    return session.query(Cliente).filter_by(nombre="Bob Torres").first()
+    ok, c = crear_cliente(session, "Carlos Mendez", "Ahorro", 500)
+    session.commit()
+    return c
 
 
 @pytest.fixture
-def admin_user(session):
-    """Usuario administrador."""
-    ok, _ = registrar_primer_admin(session, "admin", "Administrador", "admin123")
-    assert ok
-    return session.query(Usuario).filter_by(username="admin").first()
+def cliente_rico(session):
+    """Cliente con saldo alto para pruebas de DPF y tarjetas."""
+    ok, c = crear_cliente(session, "Don Ricardo", "Ahorro", 10000)
+    session.commit()
+    return c
 
 
 @pytest.fixture
 def prestamo_activo(session, cliente_a):
-    """Préstamo activo de $1000 a 12 meses para cliente A."""
-    # Primero depositar más para que el cliente pueda tener el préstamo
-    depositar(session, cliente_a.id, 2000.0)
-    ok, msg = otorgar_prestamo(session, cliente_a.id, 1000.0, 12)
-    assert ok, f"No se pudo crear préstamo: {msg}"
-    session.refresh(cliente_a)
-    return (session.query(Prestamo)
-            .filter_by(cliente_id=cliente_a.id, estado="ACTIVO")
-            .first())
+    depositar(session, cliente_a.id, 5000)
+    ok, p = otorgar_prestamo(session, cliente_a.id, 1000, 12)
+    session.commit()
+    return p
 
 
 # ══════════════════════════════════════════════════════════════
-# 1. TESTS DE CLIENTES
+# 1. TIPOS DE CUENTA
 # ══════════════════════════════════════════════════════════════
 
-class TestClientes:
+class TestTiposCuenta:
 
-    def test_crear_cliente_basico(self, session):
-        ok, msg = crear_cliente(session, "Maria Lopez", "ahorro", 0.0)
+    def test_inicializar_tipos_crea_defaults(self, session):
+        inicializar_tipos_cuenta(session)
+        tipos = session.query(TipoCuenta).all()
+        assert len(tipos) >= 5
+        nombres = [t.nombre for t in tipos]
+        assert "Ahorro" in nombres
+        assert "Corriente" in nombres
+        assert "Infantil" in nombres
+
+    def test_inicializar_tipos_es_idempotente(self, session):
+        inicializar_tipos_cuenta(session)
+        inicializar_tipos_cuenta(session)  # segunda vez no duplica
+        count = session.query(TipoCuenta).count()
+        assert count == 5
+
+    def test_crear_tipo_cuenta_nuevo(self, session):
+        ok, tc = crear_tipo_cuenta(session, "Premium", 0.05, 1000, False, "Cuenta premium")
         assert ok
-        c = session.query(Cliente).filter_by(nombre="Maria Lopez").first()
-        assert c is not None
-        assert c.estado == "ACTIVO"
-        assert float(c.saldo) == 0.0
+        assert tc.nombre == "Premium"
+        assert float(tc.tasa_interes) == pytest.approx(0.05)
 
-    def test_crear_cliente_saldo_inicial(self, session):
-        ok, msg = crear_cliente(session, "Pedro Ramos", "ahorro", 500.0)
-        assert ok
-        c = session.query(Cliente).filter_by(nombre="Pedro Ramos").first()
-        # El saldo inicial de $500 no tiene comisión de apertura
-        assert float(c.saldo) == 500.0
-
-    def test_crear_cliente_nombre_duplicado(self, session, cliente_a):
-        ok, msg = crear_cliente(session, "Ana Garcia", "ahorro", 0.0)
+    def test_crear_tipo_cuenta_duplicado_falla(self, session):
+        inicializar_tipos_cuenta(session)
+        ok, msg = crear_tipo_cuenta(session, "Ahorro", 0.03, 25, False)
         assert not ok
-        assert "existe" in msg.lower()
+        assert "Ya existe" in msg
 
-    def test_crear_cliente_saldo_negativo(self, session):
-        ok, msg = crear_cliente(session, "Test User", "ahorro", -100.0)
+    def test_tipo_cuenta_saldo_minimo(self, session):
+        ok, tc = crear_tipo_cuenta(session, "Empresarial Plus", 0.02, 5000, True)
+        assert ok
+        assert float(tc.saldo_minimo) == pytest.approx(5000.0)
+
+
+# ══════════════════════════════════════════════════════════════
+# 2. SUCURSALES Y ATM
+# ══════════════════════════════════════════════════════════════
+
+class TestSucursales:
+
+    def test_inicializar_sucursales_crea_defaults(self, session):
+        inicializar_sucursales(session)
+        sucursales = session.query(Sucursal).all()
+        assert len(sucursales) >= 4
+        nombres = [s.nombre for s in sucursales]
+        assert "Central" in nombres
+
+    def test_inicializar_sucursales_crea_atm(self, session):
+        inicializar_sucursales(session)
+        atms = session.query(ATM).all()
+        assert len(atms) >= 4  # un ATM por sucursal
+
+    def test_inicializar_sucursales_idempotente(self, session):
+        inicializar_sucursales(session)
+        inicializar_sucursales(session)
+        count = session.query(Sucursal).count()
+        assert count == 4
+
+    def test_crear_sucursal_nueva(self, session):
+        ok, s = crear_sucursal(session, "Sonsonate", "Av. Central #10", "2450-0001")
+        assert ok
+        assert s.nombre == "Sonsonate"
+
+    def test_crear_sucursal_duplicada_falla(self, session):
+        crear_sucursal(session, "Norte", "Col. Escalón", "2200-0001")
+        ok, msg = crear_sucursal(session, "Norte", "Otra dirección", "2200-0002")
         assert not ok
+        assert "Ya existe" in msg
 
-    def test_editar_cliente(self, session, cliente_a):
-        ok, msg = editar_cliente(session, cliente_a.id, telefono="555-1234", email="ana@test.com")
+
+# ══════════════════════════════════════════════════════════════
+# 3. BENEFICIARIOS FRECUENTES
+# ══════════════════════════════════════════════════════════════
+
+class TestBeneficiarios:
+
+    def test_agregar_beneficiario_valido(self, session, cliente_a, cliente_b):
+        ok, b = agregar_beneficiario(session, cliente_a.id, cliente_b.num_cuenta, "Carlos")
         assert ok
-        session.refresh(cliente_a)
-        assert cliente_a.telefono == "555-1234"
-        assert cliente_a.email == "ana@test.com"
+        assert b.cuenta_destino == cliente_b.num_cuenta
+        assert b.alias == "Carlos"
 
-    def test_suspender_y_reactivar(self, session, cliente_a):
-        ok, _ = suspender_cliente(session, cliente_a.id, "Prueba")
+    def test_beneficiario_a_si_mismo_falla(self, session, cliente_a):
+        ok, msg = agregar_beneficiario(session, cliente_a.id, cliente_a.num_cuenta, "Yo")
+        assert not ok
+        assert "ti mismo" in msg.lower()
+
+    def test_beneficiario_cuenta_inexistente_falla(self, session, cliente_a):
+        ok, msg = agregar_beneficiario(session, cliente_a.id, "XXXX-00000000", "Nadie")
+        assert not ok
+        assert "no encontrado" in msg.lower()
+
+    def test_beneficiario_duplicado_falla(self, session, cliente_a, cliente_b):
+        agregar_beneficiario(session, cliente_a.id, cliente_b.num_cuenta, "Carlos")
+        ok, msg = agregar_beneficiario(session, cliente_a.id, cliente_b.num_cuenta, "Carlos2")
+        assert not ok
+        assert "ya está registrado" in msg.lower()
+
+    def test_eliminar_beneficiario(self, session, cliente_a, cliente_b):
+        ok, b = agregar_beneficiario(session, cliente_a.id, cliente_b.num_cuenta, "Carlos")
+        ok2, msg = eliminar_beneficiario(session, b.id, cliente_a.id)
+        assert ok2
+        assert "eliminado" in msg.lower()
+
+    def test_eliminar_beneficiario_ajeno_falla(self, session, cliente_a, cliente_b):
+        ok, b = agregar_beneficiario(session, cliente_a.id, cliente_b.num_cuenta, "Carlos")
+        ok2, msg = eliminar_beneficiario(session, b.id, cliente_b.id)  # otro cliente
+        assert not ok2
+
+
+# ══════════════════════════════════════════════════════════════
+# 4. DEPÓSITO A PLAZO FIJO
+# ══════════════════════════════════════════════════════════════
+
+class TestDepositoPlazoFijo:
+
+    def test_crear_dpf_basico(self, session, cliente_rico):
+        saldo_antes = cliente_rico.saldo
+        ok, dpf = crear_deposito_plazo(session, cliente_rico.id, 1000, 0.05, 12)
         assert ok
-        session.refresh(cliente_a)
-        assert cliente_a.estado == "SUSPENDIDO"
+        assert dpf.monto == Decimal("1000.00")
+        session.refresh(cliente_rico)
+        assert cliente_rico.saldo == saldo_antes - Decimal("1000.00")
 
-        ok, _ = reactivar_cliente(session, cliente_a.id)
+    def test_dpf_calcula_interes_correcto(self, session, cliente_rico):
+        ok, dpf = crear_deposito_plazo(session, cliente_rico.id, 1200, 0.10, 12)
         assert ok
-        session.refresh(cliente_a)
-        assert cliente_a.estado == "ACTIVO"
+        # interes = 1200 * 0.10 * 12/12 = 120
+        assert float(dpf.interes_proyectado) == pytest.approx(120.0, abs=0.01)
+        assert float(dpf.monto_total) == pytest.approx(1320.0, abs=0.01)
 
-    def test_cerrar_cuenta_con_saldo(self, session, cliente_a):
-        """No se puede cerrar si tiene saldo > 0."""
-        ok, msg = cerrar_cuenta(session, cliente_a.id)
+    def test_dpf_monto_minimo_falla(self, session, cliente_rico):
+        ok, msg = crear_deposito_plazo(session, cliente_rico.id, 100, 0.05, 6)
+        assert not ok
+        assert "500" in msg
+
+    def test_dpf_plazo_cero_falla(self, session, cliente_rico):
+        ok, msg = crear_deposito_plazo(session, cliente_rico.id, 1000, 0.05, 0)
+        assert not ok
+        assert "plazo" in msg.lower()
+
+    def test_dpf_saldo_insuficiente_falla(self, session, cliente_a):
+        # cliente_a tiene 1000, intenta DPF de 2000
+        ok, msg = crear_deposito_plazo(session, cliente_a.id, 2000, 0.05, 6)
         assert not ok
         assert "saldo" in msg.lower()
 
-    def test_cerrar_cuenta_vacia(self, session):
-        crear_cliente(session, "Cliente Cero", "ahorro", 0.0)
-        c = session.query(Cliente).filter_by(nombre="Cliente Cero").first()
-        ok, _ = cerrar_cuenta(session, c.id)
-        assert ok
-        session.refresh(c)
-        assert c.estado == "CERRADO"
+    def test_dpf_cliente_inexistente_falla(self, session):
+        ok, msg = crear_deposito_plazo(session, 9999, 1000, 0.05, 6)
+        assert not ok
+        assert "no encontrado" in msg.lower()
+
+    def test_vencer_dpf_acredita_saldo(self, session, cliente_rico):
+        saldo_antes = float(cliente_rico.saldo)
+        ok, dpf = crear_deposito_plazo(session, cliente_rico.id, 1000, 0.05, 12)
+        ok2, dpf2 = vencer_deposito_plazo(session, dpf.id)
+        assert ok2
+        session.refresh(cliente_rico)
+        # El cliente recupera capital + intereses
+        assert float(cliente_rico.saldo) == pytest.approx(saldo_antes - 1000 + float(dpf2.monto_total), abs=0.01)
+
+    def test_vencer_dpf_cambia_estado(self, session, cliente_rico):
+        ok, dpf = crear_deposito_plazo(session, cliente_rico.id, 500, 0.05, 6)
+        vencer_deposito_plazo(session, dpf.id)
+        session.refresh(dpf)
+        assert dpf.estado == "VENCIDO"
+
+    def test_vencer_dpf_ya_vencido_falla(self, session, cliente_rico):
+        ok, dpf = crear_deposito_plazo(session, cliente_rico.id, 500, 0.05, 6)
+        vencer_deposito_plazo(session, dpf.id)
+        ok2, msg = vencer_deposito_plazo(session, dpf.id)
+        assert not ok2
+        assert "activo" in msg.lower()
+
+    def test_vencer_dpf_inexistente_falla(self, session):
+        ok, msg = vencer_deposito_plazo(session, 9999)
+        assert not ok
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. TESTS DE OPERACIONES BANCARIAS
+# 5. GARANTÍAS Y REFINANCIAMIENTO
 # ══════════════════════════════════════════════════════════════
 
-class TestDeposito:
+class TestGarantiasRefinanciamiento:
 
-    def test_deposito_basico(self, session, cliente_a):
-        saldo_antes = float(cliente_a.saldo)
-        ok, msg = depositar(session, cliente_a.id, 100.0)
+    def test_agregar_garantia_a_prestamo(self, session, prestamo_activo):
+        ok, g = agregar_garantia(session, prestamo_activo.id, "Inmueble",
+                                  "Casa en Col. Escalón", 50000, "REG-001")
         assert ok
-        session.refresh(cliente_a)
-        # El cliente recibe 98% (2% comisión)
-        tasa = float(tasa_deposito(session))
-        neto_esperado = saldo_antes + (100.0 * (1 - tasa))
-        assert abs(float(cliente_a.saldo) - neto_esperado) < 0.01
+        assert float(g.valor_estimado) == pytest.approx(50000.0)
+        assert g.tipo == "Inmueble"
 
-    def test_deposito_registra_movimiento(self, session, cliente_a):
-        depositar(session, cliente_a.id, 200.0)
-        movs = session.query(Movimiento).filter_by(
-            cliente_id=cliente_a.id, tipo="Deposito"
-        ).all()
-        assert len(movs) >= 1
-
-    def test_deposito_cuenta_suspendida(self, session, cliente_a):
-        suspender_cliente(session, cliente_a.id)
-        ok, msg = depositar(session, cliente_a.id, 100.0)
+    def test_garantia_prestamo_inexistente_falla(self, session):
+        ok, msg = agregar_garantia(session, 9999, "Vehículo", "Pick-up 2020", 15000)
         assert not ok
-        assert "suspendido" in msg.lower()
+        assert "no encontrado" in msg.lower()
 
-    def test_deposito_monto_minimo(self, session, cliente_a):
-        ok, msg = depositar(session, cliente_a.id, 0.5)
-        assert not ok
-
-    def test_deposito_genera_ingreso_banco(self, session, cliente_a):
-        comisiones_antes = saldo_cuenta(session, "Ingresos Comisiones")
-        depositar(session, cliente_a.id, 1000.0)
-        comisiones_despues = saldo_cuenta(session, "Ingresos Comisiones")
-        tasa = float(tasa_deposito(session))
-        assert abs((comisiones_despues - comisiones_antes) - 1000 * tasa) < 0.01
-
-
-class TestRetiro:
-
-    def test_retiro_basico(self, session, cliente_a):
-        saldo_antes = float(cliente_a.saldo)
-        ok, msg = retirar(session, cliente_a.id, 100.0)
+    def test_refinanciar_prestamo_activo(self, session, prestamo_activo):
+        ok, nuevo = refinanciar_prestamo(session, prestamo_activo.id, 24)
         assert ok
-        session.refresh(cliente_a)
-        assert abs(float(cliente_a.saldo) - (saldo_antes - 100.0)) < 0.01
+        assert nuevo.plazo_meses == 24
+        session.refresh(prestamo_activo)
+        assert prestamo_activo.estado == "REFINANCIADO"
 
-    def test_retiro_saldo_insuficiente(self, session, cliente_a):
-        ok, msg = retirar(session, cliente_a.id, 999999.0)
-        assert not ok
-        assert "insuficiente" in msg.lower()
-
-    def test_retiro_total(self, session, cliente_a):
-        saldo = float(cliente_a.saldo)
-        ok, _ = retirar(session, cliente_a.id, saldo)
+    def test_refinanciar_genera_nuevas_cuotas(self, session, prestamo_activo):
+        ok, nuevo = refinanciar_prestamo(session, prestamo_activo.id, 6)
         assert ok
-        session.refresh(cliente_a)
-        assert float(cliente_a.saldo) == 0.0
+        cuotas = session.query(CuotaPrestamo).filter_by(prestamo_id=nuevo.id).all()
+        assert len(cuotas) == 6
 
-    def test_retiro_registra_movimiento(self, session, cliente_a):
-        retirar(session, cliente_a.id, 50.0)
-        movs = session.query(Movimiento).filter_by(
-            cliente_id=cliente_a.id, tipo="Retiro"
-        ).all()
-        assert len(movs) == 1
-        assert float(movs[0].monto) == 50.0
-
-
-class TestTransferencia:
-
-    def test_transferencia_basica(self, session, cliente_a, cliente_b):
-        saldo_a = float(cliente_a.saldo)
-        saldo_b = float(cliente_b.saldo)
-        tasa = float(tasa_transferencia(session))
-
-        ok, msg = transferir(session, cliente_a.id, cliente_b.id, 100.0)
-        assert ok
-
-        session.refresh(cliente_a)
-        session.refresh(cliente_b)
-
-        # B recibe exactamente $100
-        assert abs(float(cliente_b.saldo) - (saldo_b + 100.0)) < 0.01
-        # A paga $100 + comisión
-        assert abs(float(cliente_a.saldo) - (saldo_a - 100.0 * (1 + tasa))) < 0.01
-
-    def test_transferencia_a_si_mismo(self, session, cliente_a):
-        ok, msg = transferir(session, cliente_a.id, cliente_a.id, 50.0)
+    def test_refinanciar_prestamo_inexistente_falla(self, session):
+        ok, msg = refinanciar_prestamo(session, 9999, 12)
         assert not ok
+        assert "no encontrado" in msg.lower()
 
-    def test_transferencia_saldo_insuficiente(self, session, cliente_a, cliente_b):
-        ok, msg = transferir(session, cliente_a.id, cliente_b.id, 999999.0)
+    def test_refinanciar_prestamo_pagado_falla(self, session, cliente_a, prestamo_activo):
+        # Pagar todo el préstamo
+        depositar(session, cliente_a.id, 5000)
+        session.commit()
+        pagar_prestamo(session, cliente_a.id, float(prestamo_activo.saldo_pendiente) + 100)
+        session.commit()
+        session.refresh(prestamo_activo)
+        ok, msg = refinanciar_prestamo(session, prestamo_activo.id, 12)
         assert not ok
-        assert "insuficiente" in msg.lower()
-
-    def test_transferencia_doble_movimiento(self, session, cliente_a, cliente_b):
-        transferir(session, cliente_a.id, cliente_b.id, 50.0)
-        enviados  = session.query(Movimiento).filter_by(
-            cliente_id=cliente_a.id, tipo="Transferencia Enviada").count()
-        recibidos = session.query(Movimiento).filter_by(
-            cliente_id=cliente_b.id, tipo="Transferencia Recibida").count()
-        assert enviados >= 1
-        assert recibidos >= 1
 
 
 # ══════════════════════════════════════════════════════════════
-# 3. TESTS DE PRÉSTAMOS
+# 6. SCORE CREDITICIO
 # ══════════════════════════════════════════════════════════════
 
-class TestPrestamos:
+class TestScoreCrediticio:
 
-    def test_otorgar_prestamo_basico(self, session, cliente_a):
-        saldo_antes = float(cliente_a.saldo)
-        ok, msg = otorgar_prestamo(session, cliente_a.id, 500.0, 12)
-        assert ok
+    def test_score_cliente_nuevo(self, session, cliente_a):
+        sc = calcular_score(session, cliente_a.id)
+        assert sc is not None
+        assert 300 <= sc.score <= 850
+
+    def test_score_base_sin_prestamos_es_500(self, session, cliente_a):
+        sc = calcular_score(session, cliente_a.id)
+        # Sin préstamos ni historial, score base = 500
+        assert sc.score == 500
+
+    def test_score_sube_con_saldo_alto(self, session, cliente_rico):
+        sc = calcular_score(session, cliente_rico.id)
+        # saldo > 5000 => +100 + +50 = +150 sobre base 500
+        assert sc.score >= 650
+
+    def test_score_cliente_inexistente_retorna_none(self, session):
+        resultado = calcular_score(session, 9999)
+        assert resultado is None
+
+    def test_score_se_actualiza_segunda_vez(self, session, cliente_a):
+        sc1 = calcular_score(session, cliente_a.id)
+        score1 = sc1.score
+        depositar(session, cliente_a.id, 10000)
+        session.commit()
+        sc2 = calcular_score(session, cliente_a.id)
+        # El mismo objeto debe actualizarse, no duplicarse
+        count = session.query(ScoreCredito).filter_by(cliente_id=cliente_a.id).count()
+        assert count == 1
+
+    def test_score_guarda_categoria(self, session, cliente_a):
+        sc = calcular_score(session, cliente_a.id)
+        assert sc.categoria in ("Excelente", "Bueno", "Regular", "Malo", "Muy Malo")
+
+    def test_score_actualiza_campo_en_cliente(self, session, cliente_a):
+        calcular_score(session, cliente_a.id)
         session.refresh(cliente_a)
-        # El dinero del préstamo se acredita al cliente
-        assert float(cliente_a.saldo) > saldo_antes
+        assert cliente_a.score_credito is not None
 
-    def test_prestamo_crea_cuotas(self, session, cliente_a):
-        otorgar_prestamo(session, cliente_a.id, 500.0, 12)
-        p = session.query(Prestamo).filter_by(
-            cliente_id=cliente_a.id, estado="ACTIVO"
-        ).first()
-        assert p is not None
-        assert len(p.cuotas) == 12
 
-    def test_prestamo_tiene_fecha_vencimiento(self, session, cliente_a):
-        otorgar_prestamo(session, cliente_a.id, 500.0, 6)
-        p = session.query(Prestamo).filter_by(
-            cliente_id=cliente_a.id, estado="ACTIVO"
-        ).first()
-        assert p.fecha_vencimiento is not None
-        assert p.plazo_meses == 6
+# ══════════════════════════════════════════════════════════════
+# 7. TARJETAS
+# ══════════════════════════════════════════════════════════════
 
-    def test_prestamo_monto_minimo(self, session, cliente_a):
-        ok, msg = otorgar_prestamo(session, cliente_a.id, 50.0, 12)
+class TestTarjetas:
+
+    def test_emitir_tarjeta_debito(self, session, cliente_a):
+        ok, td = emitir_tarjeta_debito(session, cliente_a.id)
+        assert ok
+        assert td.cliente_id == cliente_a.id
+        assert td.numero is not None
+        assert len(td.numero) == 16
+
+    def test_tarjeta_debito_tiene_cvv(self, session, cliente_a):
+        ok, td = emitir_tarjeta_debito(session, cliente_a.id)
+        assert ok
+        assert td.cvv is not None
+        assert len(td.cvv) == 3
+
+    def test_emitir_tarjeta_debito_cliente_inexistente_falla(self, session):
+        ok, msg = emitir_tarjeta_debito(session, 9999)
         assert not ok
-        assert "mínimo" in msg.lower()
+        assert "no encontrado" in msg.lower()
 
-    def test_pagar_prestamo_parcial(self, session, prestamo_activo, cliente_a):
-        p = prestamo_activo
-        # Primero pagamos todos los intereses para que el siguiente pago baje el capital
-        interes_pendiente = float(p.interes) - float(p.interes_pagado)
-        if interes_pendiente > 0:
-            ok, msg = pagar_prestamo(session, cliente_a.id, interes_pendiente)
-            assert ok, f"No se pudo pagar intereses: {msg}"
-            session.refresh(p)
+    def test_emitir_tarjeta_credito_sin_score(self, session, cliente_a):
+        # Sin score calculado, score_credito es None => debe emitirse
+        ok, tc = emitir_tarjeta_credito(session, cliente_a.id, 2000)
+        assert ok
+        assert float(tc.limite) == pytest.approx(2000.0)
 
-        # Ahora un pago de capital
-        saldo_pendiente_antes = float(p.saldo_pendiente)
-        session.refresh(cliente_a)
-        if float(cliente_a.saldo) >= 100:
-            ok, msg = pagar_prestamo(session, cliente_a.id, 100.0)
-            assert ok, f"Fallo pago capital: {msg}"
-            session.refresh(p)
-            assert float(p.saldo_pendiente) < saldo_pendiente_antes
-        else:
-            # Si no tiene saldo suficiente, al menos verificamos que el pago de intereses funcionó
-            assert float(p.interes_pagado) > 0
+    def test_emitir_tarjeta_credito_score_bajo_falla(self, session, cliente_a):
+        # Fijar score bajo manualmente
+        cliente_a.score_credito = 400
+        session.flush()
+        ok, msg = emitir_tarjeta_credito(session, cliente_a.id, 1000)
+        assert not ok
+        assert "500" in msg
 
-    def test_pagar_prestamo_completo(self, session, cliente_a):
-        """Pagar el préstamo completo debe marcarlo como PAGADO."""
-        depositar(session, cliente_a.id, 5000.0)
-        session.refresh(cliente_a)
-        ok, _ = otorgar_prestamo(session, cliente_a.id, 500.0, 12)
+    def test_emitir_tarjeta_credito_score_alto_ok(self, session, cliente_rico):
+        calcular_score(session, cliente_rico.id)
+        session.refresh(cliente_rico)
+        ok, tc = emitir_tarjeta_credito(session, cliente_rico.id, 5000)
         assert ok
 
-        p = session.query(Prestamo).filter_by(
-            cliente_id=cliente_a.id, estado="ACTIVO"
-        ).first()
-        deuda_total = float(p.saldo_pendiente) + float(p.interes) - float(p.interes_pagado)
+    def test_tarjeta_credito_cliente_inexistente_falla(self, session):
+        ok, msg = emitir_tarjeta_credito(session, 9999, 1000)
+        assert not ok
 
-        ok, msg = pagar_prestamo(session, cliente_a.id, deuda_total)
+
+# ══════════════════════════════════════════════════════════════
+# 8. AML — ANTI LAVADO DE DINERO
+# ══════════════════════════════════════════════════════════════
+
+class TestAML:
+
+    def test_monto_alto_genera_alerta_critica(self, session, cliente_a):
+        alertas = verificar_aml(session, cliente_a.id, 15000, "Depósito")
+        assert len(alertas) == 1
+        assert alertas[0].tipo == "MONTO_ALTO"
+        assert alertas[0].nivel == "CRITICA"
+
+    def test_monto_bajo_no_genera_alerta(self, session, cliente_a):
+        alertas = verificar_aml(session, cliente_a.id, 500, "Depósito")
+        assert len(alertas) == 0
+
+    def test_monto_exacto_umbral_genera_alerta(self, session, cliente_a):
+        # Exactamente en el umbral (10000) debe generar alerta
+        alertas = verificar_aml(session, cliente_a.id, 10000, "Depósito")
+        assert len(alertas) == 1
+
+    def test_multiples_transferencias_genera_alerta(self, session, cliente_a, cliente_b):
+        # Crear 5 transferencias para el mismo cliente hoy
+        depositar(session, cliente_a.id, 50000)
+        session.commit()
+        for _ in range(5):
+            transferir(session, cliente_a.id, cliente_b.id, 100)
+            session.commit()
+        # La 6ta transferencia dispara alerta de múltiples
+        alertas = verificar_aml(session, cliente_a.id, 100, "transferencia")
+        aml_tipos = [a.tipo for a in alertas]
+        assert "MULT_TRANSFERENCIAS" in aml_tipos
+
+    def test_obtener_alertas_pendientes(self, session, cliente_a):
+        verificar_aml(session, cliente_a.id, 12000, "Depósito")
+        session.flush()
+        alertas = obtener_alertas_aml(session, "PENDIENTE")
+        assert len(alertas) >= 1
+
+    def test_obtener_alertas_todas(self, session, cliente_a):
+        verificar_aml(session, cliente_a.id, 12000, "Depósito")
+        session.flush()
+        alertas = obtener_alertas_aml(session, "TODAS")
+        assert len(alertas) >= 1
+
+    def test_revisar_alerta_aml(self, session, cliente_a):
+        alertas = verificar_aml(session, cliente_a.id, 20000, "Depósito")
+        session.flush()
+        alerta = alertas[0]
+        ok, a = revisar_alerta_aml(session, alerta.id, "AuditorJuan", "Revisado", cerrar=False)
         assert ok
-        session.refresh(p)
-        assert p.estado == "PAGADO"
+        assert a.estado == "REVISADA"
+        assert a.revisado_por == "AuditorJuan"
 
-    def test_multiples_prestamos_activos(self, session, cliente_a):
-        """Un cliente puede tener más de un préstamo activo."""
-        depositar(session, cliente_a.id, 5000.0)
-        ok1, _ = otorgar_prestamo(session, cliente_a.id, 300.0, 6)
-        ok2, _ = otorgar_prestamo(session, cliente_a.id, 200.0, 12)
-        assert ok1 and ok2
-        activos = session.query(Prestamo).filter_by(
-            cliente_id=cliente_a.id, estado="ACTIVO"
+    def test_cerrar_alerta_aml(self, session, cliente_a):
+        alertas = verificar_aml(session, cliente_a.id, 20000, "Depósito")
+        session.flush()
+        ok, a = revisar_alerta_aml(session, alertas[0].id, "AuditorJuan", cerrar=True)
+        assert ok
+        assert a.estado == "CERRADA"
+
+    def test_revisar_alerta_inexistente_falla(self, session):
+        ok, msg = revisar_alerta_aml(session, 9999, "Auditor")
+        assert not ok
+
+
+# ══════════════════════════════════════════════════════════════
+# 9. CIERRE DIARIO
+# ══════════════════════════════════════════════════════════════
+
+class TestCierreDiario:
+
+    def test_cierre_diario_basico(self, session, cliente_a):
+        depositar(session, cliente_a.id, 200)
+        session.commit()
+        ok, cierre = realizar_cierre_diario(session, "AdminTest", "Cierre prueba")
+        assert ok
+        assert cierre.realizado_por == "AdminTest"
+
+    def test_cierre_diario_solo_uno_por_dia(self, session, cliente_a):
+        realizar_cierre_diario(session, "Admin1")
+        session.commit()
+        ok, msg = realizar_cierre_diario(session, "Admin2")
+        assert not ok
+        assert "ya se realizó" in msg.lower()
+
+    def test_cierre_registra_totales(self, session, cliente_a):
+        depositar(session, cliente_a.id, 500)
+        session.commit()
+        ok, cierre = realizar_cierre_diario(session, "Admin")
+        assert ok
+        assert float(cierre.total_depositos) >= 500
+
+
+# ══════════════════════════════════════════════════════════════
+# 10. BALANCE GENERAL Y ESTADO DE RESULTADOS
+# ══════════════════════════════════════════════════════════════
+
+class TestEstadosFinancieros:
+
+    def test_balance_general_tiene_estructura(self, session):
+        bg = generar_balance_general(session)
+        assert "activos" in bg
+        assert "pasivos" in bg
+        assert "patrimonio" in bg
+        assert "ecuacion_ok" in bg
+
+    def test_balance_general_ecuacion_cuadrada(self, session, cliente_a):
+        depositar(session, cliente_a.id, 1000)
+        session.commit()
+        bg = generar_balance_general(session)
+        assert bg["ecuacion_ok"]
+
+    def test_balance_general_con_operaciones(self, session, cliente_a, cliente_b):
+        depositar(session, cliente_a.id, 2000)
+        transferir(session, cliente_a.id, cliente_b.id, 500)
+        session.commit()
+        bg = generar_balance_general(session)
+        assert bg["ecuacion_ok"]
+
+    def test_estado_resultados_tiene_estructura(self, session):
+        er = generar_estado_resultados(session)
+        assert "ingresos" in er
+        assert "gastos" in er
+        assert "utilidad" in er
+
+    def test_estado_resultados_ingresos_positivos_tras_deposito(self, session, cliente_a):
+        depositar(session, cliente_a.id, 1000)
+        session.commit()
+        er = generar_estado_resultados(session)
+        assert er["total_ingresos"] >= 0
+
+
+# ══════════════════════════════════════════════════════════════
+# 11. SOCIOS Y APORTES
+# ══════════════════════════════════════════════════════════════
+
+class TestSocios:
+
+    def test_registrar_socio(self, session, cliente_a):
+        ok, socio = registrar_socio(session, cliente_a.id)
+        assert ok
+        assert socio.cliente_id == cliente_a.id
+        assert socio.numero_socio.startswith("SOC-")
+
+    def test_registrar_socio_duplicado_falla(self, session, cliente_a):
+        registrar_socio(session, cliente_a.id)
+        ok, msg = registrar_socio(session, cliente_a.id)
+        assert not ok
+        assert "ya es socio" in msg.lower()
+
+    def test_registrar_socio_cliente_inexistente_falla(self, session):
+        ok, msg = registrar_socio(session, 9999)
+        assert not ok
+        assert "no encontrado" in msg.lower()
+
+    def test_registrar_socio_con_aporte_inicial(self, session, cliente_a):
+        ok, socio = registrar_socio(session, cliente_a.id, aporte_inicial=200)
+        assert ok
+        aportes = session.query(AporteSocio).filter_by(socio_id=socio.id).all()
+        assert len(aportes) == 1
+        assert float(aportes[0].monto) == pytest.approx(200.0)
+
+    def test_registrar_aporte_adicional(self, session, cliente_a):
+        ok, socio = registrar_socio(session, cliente_a.id)
+        ok2, aporte = registrar_aporte(session, socio.id, 300, "EXTRAORDINARIO", "Bono")
+        assert ok2
+        assert float(aporte.monto) == pytest.approx(300.0)
+        assert aporte.tipo == "EXTRAORDINARIO"
+
+    def test_aporte_acumula_total_socio(self, session, cliente_a):
+        ok, socio = registrar_socio(session, cliente_a.id, aporte_inicial=100)
+        registrar_aporte(session, socio.id, 200)
+        session.refresh(socio)
+        assert float(socio.aporte_total) == pytest.approx(300.0)
+
+    def test_aporte_monto_cero_falla(self, session, cliente_a):
+        ok, socio = registrar_socio(session, cliente_a.id)
+        ok2, msg = registrar_aporte(session, socio.id, 0)
+        assert not ok2
+        assert "positivo" in msg.lower()
+
+    def test_aporte_socio_inexistente_falla(self, session):
+        ok, msg = registrar_aporte(session, 9999, 100)
+        assert not ok
+        assert "no encontrado" in msg.lower()
+
+    def test_aporte_genera_asiento_contable(self, session, cliente_a):
+        ok, socio = registrar_socio(session, cliente_a.id)
+        saldo_capital_antes = saldo_cuenta(session, "Capital Banco")
+        registrar_aporte(session, socio.id, 500)
+        session.commit()
+        saldo_capital_despues = saldo_cuenta(session, "Capital Banco")
+        assert saldo_capital_despues > saldo_capital_antes
+
+
+# ══════════════════════════════════════════════════════════════
+# 12. HISTORIAL CLIENTE Y CUOTAS VENCIDAS
+# ══════════════════════════════════════════════════════════════
+
+class TestHistorialYCuotas:
+
+    def test_historial_cliente_estructura(self, session, cliente_a):
+        h = historial_cliente(session, cliente_a.id)
+        assert h is not None
+        assert "cliente" in h
+        assert "movimientos" in h
+        assert "prestamos" in h
+        assert "tarjetas_debito" in h
+        assert "tarjetas_credito" in h
+        assert "depositos_plazo" in h
+        assert "beneficiarios" in h
+
+    def test_historial_incluye_movimientos(self, session, cliente_a):
+        depositar(session, cliente_a.id, 200)
+        session.commit()
+        h = historial_cliente(session, cliente_a.id)
+        assert len(h["movimientos"]) >= 1
+
+    def test_historial_incluye_prestamos(self, session, prestamo_activo, cliente_a):
+        h = historial_cliente(session, cliente_a.id)
+        assert len(h["prestamos"]) >= 1
+
+    def test_historial_cliente_inexistente_retorna_none(self, session):
+        h = historial_cliente(session, 9999)
+        assert h is None
+
+    def test_actualizar_cuotas_vencidas(self, session, cliente_a):
+        depositar(session, cliente_a.id, 5000)
+        ok, p = otorgar_prestamo(session, cliente_a.id, 1200, 12)
+        session.commit()
+        # Forzar vencimiento de cuotas
+        cuotas = session.query(CuotaPrestamo).filter_by(prestamo_id=p.id).all()
+        for c in cuotas[:3]:
+            c.fecha_vencimiento = date.today() - timedelta(days=10)
+        session.commit()
+        count = actualizar_cuotas_vencidas(session)
+        assert count == 3
+        vencidas = session.query(CuotaPrestamo).filter_by(
+            prestamo_id=p.id, estado="VENCIDA"
         ).count()
-        assert activos == 2
+        assert vencidas == 3
 
-    def test_devengar_interes(self, session, cliente_a):
-        depositar(session, cliente_a.id, 2000.0)
-        otorgar_prestamo(session, cliente_a.id, 1000.0, 12)
-        ok, msg = devengar_interes(session)
+    def test_actualizar_cuotas_sin_vencidas(self, session, cliente_a):
+        # Sin cuotas vencidas, debe retornar 0
+        count = actualizar_cuotas_vencidas(session)
+        assert count == 0
+
+
+# ══════════════════════════════════════════════════════════════
+# 13. REVERSIÓN DE OPERACIONES
+# ══════════════════════════════════════════════════════════════
+
+class TestReversionOperaciones:
+
+    def test_revertir_deposito(self, session, cliente_a):
+        saldo_antes = float(cliente_a.saldo)
+        ok_dep, dep = depositar(session, cliente_a.id, 300)
+        session.commit()
+        mov = session.query(Movimiento).filter_by(
+            cliente_id=cliente_a.id, tipo="Deposito"
+        ).order_by(Movimiento.id.desc()).first()
+        ok, msg = revertir_operacion(session, mov.id, "Test reverso")
+        print("OK =", ok)
+        print("MSG =", msg)
         assert ok
-        assert "préstamo" in msg.lower()
+        session.refresh(cliente_a)
+        assert float(cliente_a.saldo) == pytest.approx(saldo_antes, abs=0.01)
 
-    def test_pago_supera_deuda(self, session, prestamo_activo, cliente_a):
-        p = prestamo_activo
-        deuda = float(p.saldo_pendiente) + float(p.interes)
-        ok, msg = pagar_prestamo(session, cliente_a.id, deuda + 1000.0)
+    def test_revertir_retiro(self, session, cliente_a):
+        saldo_antes = float(cliente_a.saldo)
+        retirar(session, cliente_a.id, 200)
+        session.commit()
+        mov = session.query(Movimiento).filter_by(
+            cliente_id=cliente_a.id, tipo="Retiro"
+        ).order_by(Movimiento.id.desc()).first()
+        ok, msg = revertir_operacion(session, mov.id)
+        assert ok
+        session.refresh(cliente_a)
+        assert float(cliente_a.saldo) == pytest.approx(saldo_antes, abs=0.01)
+
+    def test_revertir_dos_veces_falla(self, session, cliente_a):
+        depositar(session, cliente_a.id, 100)
+        session.commit()
+        mov = session.query(Movimiento).filter_by(
+            cliente_id=cliente_a.id, tipo="Deposito"
+        ).order_by(Movimiento.id.desc()).first()
+        revertir_operacion(session, mov.id)
+        ok, msg = revertir_operacion(session, mov.id)
         assert not ok
-        assert "supera" in msg.lower()
+        assert "ya fue revertida" in msg.lower()
+
+    def test_revertir_movimiento_inexistente_falla(self, session):
+        ok, msg = revertir_operacion(session, 99999)
+        assert not ok
+        assert "no encontrado" in msg.lower()
+
+    def test_no_revertir_pago_prestamo(self, session, prestamo_activo, cliente_a):
+        depositar(session, cliente_a.id, 5000)
+        session.commit()
+        pagar_prestamo(session, cliente_a.id, 100)
+        session.commit()
+        mov = session.query(Movimiento).filter_by(
+            cliente_id=cliente_a.id, tipo="Pago Prestamo"
+        ).order_by(Movimiento.id.desc()).first()
+        if mov:
+            ok, msg = revertir_operacion(session, mov.id)
+            assert not ok
+            assert "reversible" in msg.lower() or "no es reversible" in msg.lower()
+
+    def test_revertir_operacion_antigua_falla(self, session, cliente_a):
+        depositar(session, cliente_a.id, 100)
+        session.commit()
+        mov = session.query(Movimiento).filter_by(
+            cliente_id=cliente_a.id, tipo="Deposito"
+        ).first()
+        # Simular que el movimiento es antiguo
+        mov.fecha = datetime.utcnow() - timedelta(minutes=VENTANA_REVERSION_MIN + 5)
+        session.commit()
+        ok, msg = revertir_operacion(session, mov.id)
+        assert not ok
+        assert "minutos" in msg.lower()
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. TESTS DE CONTABILIDAD
+# 14. LÍMITES DIARIOS
 # ══════════════════════════════════════════════════════════════
 
-class TestContabilidad:
+class TestLimitesDiarios:
 
-    def test_balance_cuadrado_inicial(self, session):
-        errores, _ = reconciliar(session)
-        assert errores == 0
+    def test_retiro_dentro_del_limite(self, session, cliente_a):
+        ok, msg = verificar_limite_diario(session, cliente_a.id, "Retiro", 500)
+        assert ok
 
-    def test_balance_cuadrado_tras_deposito(self, session, cliente_a):
-        depositar(session, cliente_a.id, 500.0)
-        errores, lines = reconciliar(session)
-        assert errores == 0, "\n".join(lines)
+    def test_deposito_no_tiene_limite(self, session, cliente_a):
+        # Depósito no tiene límite configurado
+        ok, msg = verificar_limite_diario(session, cliente_a.id, "Deposito", 999999)
+        assert ok
 
-    def test_balance_cuadrado_tras_transferencia(self, session, cliente_a, cliente_b):
-        transferir(session, cliente_a.id, cliente_b.id, 100.0)
-        errores, lines = reconciliar(session)
-        assert errores == 0, "\n".join(lines)
+    def test_retiro_supera_limite_falla(self, session, cliente_a):
+        # Configurar límite bajo
+        cfg = ConfigBanco(clave="limite_retiro_diario", valor="100.00")
+        session.add(cfg)
+        session.commit()
+        # Hacer un retiro de 80 primero
+        depositar(session, cliente_a.id, 500)
+        session.commit()
+        retirar(session, cliente_a.id, 80)
+        session.commit()
+        # Intentar retirar 50 más (total 130 > 100)
+        ok, msg = verificar_limite_diario(session, cliente_a.id, "Retiro", 50)
+        assert not ok
+        assert "límite" in msg.lower() or "limite" in msg.lower()
 
-    def test_balance_cuadrado_tras_prestamo(self, session, cliente_a):
-        otorgar_prestamo(session, cliente_a.id, 500.0, 12)
-        errores, lines = reconciliar(session)
-        assert errores == 0, "\n".join(lines)
+    def test_transferencia_dentro_del_limite(self, session, cliente_a):
+        ok, msg = verificar_limite_diario(session, cliente_a.id, "Transferencia Enviada", 1000)
+        assert ok
 
-    def test_balance_cuadrado_tras_pago_prestamo(self, session, prestamo_activo, cliente_a):
-        pagar_prestamo(session, cliente_a.id, 100.0)
-        errores, lines = reconciliar(session)
-        assert errores == 0, "\n".join(lines)
+    def test_transferencia_supera_limite_falla(self, session, cliente_a, cliente_b):
+        # Configurar límite de transferencia muy bajo
+        cfg = ConfigBanco(clave="limite_transferencia_diaria", valor="200.00")
+        session.add(cfg)
+        session.commit()
+        depositar(session, cliente_a.id, 5000)
+        session.commit()
+        transferir(session, cliente_a.id, cliente_b.id, 150)
+        session.commit()
+        ok, msg = verificar_limite_diario(session, cliente_a.id, "Transferencia Enviada", 100)
+        assert not ok
 
-    def test_caja_incrementa_con_deposito(self, session, cliente_a):
+
+# ══════════════════════════════════════════════════════════════
+# 15. CONTABILIDAD — RECONCILIACIÓN
+# ══════════════════════════════════════════════════════════════
+
+class TestContabilidadAvanzada:
+
+    def test_reconciliar_retorna_resultado(self, session):
+        resultado = reconciliar(session)
+        # Debe retornar un dict o similar sin error
+        assert resultado is not None
+
+    def test_saldo_caja_aumenta_con_deposito(self, session, cliente_a):
         caja_antes = caja_real(session)
-        depositar(session, cliente_a.id, 200.0)
+        depositar(session, cliente_a.id, 500)
+        session.commit()
         caja_despues = caja_real(session)
         assert caja_despues > caja_antes
 
-    def test_caja_reduce_con_retiro(self, session, cliente_a):
+    def test_saldo_caja_disminuye_con_retiro(self, session, cliente_a):
+        depositar(session, cliente_a.id, 1000)
+        session.commit()
         caja_antes = caja_real(session)
-        retirar(session, cliente_a.id, 100.0)
+        retirar(session, cliente_a.id, 300)
+        session.commit()
         caja_despues = caja_real(session)
         assert caja_despues < caja_antes
 
-    def test_stress_100_operaciones(self, session, cliente_a, cliente_b):
-        """100 operaciones aleatorias deben dejar el balance cuadrado."""
-        import random
-        random.seed(42)
-        for _ in range(100):
-            op = random.choice(["dep", "ret", "tra"])
-            if op == "dep":
-                depositar(session, cliente_a.id, random.randint(10, 200))
-            elif op == "ret":
-                session.refresh(cliente_a)
-                if float(cliente_a.saldo) > 10:
-                    retirar(session, cliente_a.id, 10)
-            else:
-                session.refresh(cliente_a)
-                session.refresh(cliente_b)
-                if float(cliente_a.saldo) > 20:
-                    transferir(session, cliente_a.id, cliente_b.id, 10)
-
-        errores, lines = reconciliar(session)
-        assert errores == 0, "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════
-# 5. TESTS DE TASAS CONFIGURABLES
-# ══════════════════════════════════════════════════════════════
-
-class TestTasasConfigurables:
-
-    def test_tasa_deposito_default(self, session):
-        tasa = tasa_deposito(session)
-        assert tasa == Decimal("0.02")
-
-    def test_tasa_transferencia_default(self, session):
-        tasa = tasa_transferencia(session)
-        assert tasa == Decimal("0.01")
-
-    def test_tasa_prestamo_default(self, session):
-        tasa = tasa_prestamo(session)
-        assert tasa == Decimal("0.10")
-
-    def test_cambiar_tasa_deposito(self, session, cliente_a):
-        """Cambiar la tasa a 5% y verificar que aplica en el siguiente depósito."""
-        session.add(ConfigBanco(clave="tasa_deposito", valor="0.05"))
+    def test_balance_cuadrado_con_dpf(self, session, cliente_rico):
+        crear_deposito_plazo(session, cliente_rico.id, 1000, 0.05, 6)
         session.commit()
+        bg = generar_balance_general(session)
+        assert bg["ecuacion_ok"]
 
-        saldo_antes = float(cliente_a.saldo)
-        ok, _ = depositar(session, cliente_a.id, 100.0)
+    def test_balance_cuadrado_con_socio(self, session, cliente_a):
+        ok, socio = registrar_socio(session, cliente_a.id)
+        registrar_aporte(session, socio.id, 300)
+        session.commit()
+        bg = generar_balance_general(session)
+        assert bg["ecuacion_ok"]
+
+
+# ══════════════════════════════════════════════════════════════
+# 16. FLUJOS DE INTEGRACIÓN END-TO-END
+# ══════════════════════════════════════════════════════════════
+
+class TestIntegracionCompleta:
+
+    def test_flujo_completo_plazo_fijo(self, session):
+        """Crear cliente → depositar → crear DPF → vencer DPF → verificar saldo final."""
+        ok, cliente = crear_cliente(session, "Inversora SA", "Ahorro", 5000)
+        session.commit()
+        ok, dpf = crear_deposito_plazo(session, cliente.id, 2000, 0.08, 12)
+        session.commit()
         assert ok
-        session.refresh(cliente_a)
-        # Con 5% el neto debe ser $95
-        assert abs(float(cliente_a.saldo) - (saldo_antes + 95.0)) < 0.01
-
-    def test_cambiar_tasa_transferencia(self, session, cliente_a, cliente_b):
-        """Cambiar la tasa de transferencia a 2%."""
-        session.add(ConfigBanco(clave="tasa_transferencia", valor="0.02"))
+        saldo_tras_dpf = float(cliente.saldo)
+        assert saldo_tras_dpf == pytest.approx(3000.0, abs=0.01)
+        ok2, dpf2 = vencer_deposito_plazo(session, dpf.id)
         session.commit()
+        session.refresh(cliente)
+        # Debe tener 3000 + capital(2000) + intereses
+        assert float(cliente.saldo) > 5000
 
-        saldo_b = float(cliente_b.saldo)
-        ok, _ = transferir(session, cliente_a.id, cliente_b.id, 100.0)
+    def test_flujo_completo_socio_y_score(self, session):
+        """Crear cliente → hacerlo socio → aportar → calcular score."""
+        ok, cliente = crear_cliente(session, "Coopista", "Ahorro", 2000)
+        session.commit()
+        ok, socio = registrar_socio(session, cliente.id, aporte_inicial=500)
+        session.commit()
         assert ok
-        session.refresh(cliente_b)
-        # B recibe $100 exactos
-        assert abs(float(cliente_b.saldo) - (saldo_b + 100.0)) < 0.01
-
-    def test_tasa_cero_deposito(self, session, cliente_a):
-        """Con tasa 0% el cliente recibe el 100%."""
-        session.add(ConfigBanco(clave="tasa_deposito", valor="0.00"))
+        registrar_aporte(session, socio.id, 300, "EXTRAORDINARIO")
         session.commit()
+        session.refresh(socio)
+        assert float(socio.aporte_total) == pytest.approx(800.0, abs=0.01)
+        sc = calcular_score(session, cliente.id)
+        assert sc is not None
 
-        saldo_antes = float(cliente_a.saldo)
-        depositar(session, cliente_a.id, 100.0)
-        session.refresh(cliente_a)
-        assert abs(float(cliente_a.saldo) - (saldo_antes + 100.0)) < 0.01
-
-
-# ══════════════════════════════════════════════════════════════
-# 6. TESTS DE ALERTAS
-# ══════════════════════════════════════════════════════════════
-
-class TestAlertas:
-
-    def test_saldo_bajo_detectado(self, session):
-        """Cliente con $10 debe aparecer en alertas (mínimo default $50)."""
-        crear_cliente(session, "Cliente Pobre", "ahorro", 10.0)
-        alertas = verificar_saldos_bajos(session)
-        nombres = [a["extra"]["nombre"] for a in alertas]
-        assert "Cliente Pobre" in nombres
-
-    def test_saldo_suficiente_no_alerta(self, session, cliente_a):
-        """Cliente con $1000 no debe aparecer en alertas de saldo."""
-        alertas = verificar_saldos_bajos(session)
-        nombres = [a["extra"].get("nombre") for a in alertas]
-        assert "Ana Garcia" not in nombres
-
-    def test_caja_baja_detectada(self, session):
-        alertas = verificar_caja_baja(session, caja_actual=500.0)
-        assert len(alertas) == 1
-        assert alertas[0]["nivel"] == NIVEL_ERROR
-
-    def test_caja_suficiente_no_alerta(self, session):
-        alertas = verificar_caja_baja(session, caja_actual=5000.0)
-        assert len(alertas) == 0
-
-    def test_prestamo_vencido_detectado(self, session, cliente_a):
-        """Préstamo con fecha de vencimiento pasada debe generar alerta."""
-        depositar(session, cliente_a.id, 2000.0)
-        otorgar_prestamo(session, cliente_a.id, 500.0, 12)
-        p = session.query(Prestamo).filter_by(
-            cliente_id=cliente_a.id, estado="ACTIVO"
-        ).first()
-        # Retrotraer la fecha de vencimiento
-        p.fecha_vencimiento = datetime.utcnow().date() - timedelta(days=30)
+    def test_flujo_aml_y_revision(self, session):
+        """Operación de monto alto → verificar AML → revisar alerta → cerrar."""
+        ok, cliente = crear_cliente(session, "Sospechoso", "Ahorro", 100000)
         session.commit()
-
-        alertas = verificar_prestamos_vencidos(session)
-        clientes_en_alerta = [a["extra"]["cliente"] for a in alertas]
-        assert "Ana Garcia" in clientes_en_alerta
-
-    def test_prestamo_por_vencer_detectado(self, session, cliente_a):
-        """Préstamo que vence en 3 días debe generar alerta."""
-        depositar(session, cliente_a.id, 2000.0)
-        otorgar_prestamo(session, cliente_a.id, 500.0, 12)
-        p = session.query(Prestamo).filter_by(
-            cliente_id=cliente_a.id, estado="ACTIVO"
-        ).first()
-        p.fecha_vencimiento = datetime.utcnow().date() + timedelta(days=3)
-        session.commit()
-
-        alertas = verificar_prestamos_por_vencer(session)
+        alertas = verificar_aml(session, cliente.id, 50000, "Depósito masivo")
+        session.flush()
         assert len(alertas) >= 1
+        ok, alerta = revisar_alerta_aml(session, alertas[0].id, "ComplianceOfficer",
+                                         "Revisado OK", cerrar=True)
+        assert ok
+        assert alerta.estado == "CERRADA"
 
-    def test_login_fallido_detectado(self, session, admin_user):
-        """3 intentos fallidos en 15 min deben generar alerta."""
-        from auth import registrar_log
-        for _ in range(3):
-            log = AuditLog(
-                username="hacker",
-                rol="—",
-                accion="LOGIN_FALLIDO",
-                detalle="intento",
-                resultado="ERROR",
-                fecha=datetime.utcnow(),
-            )
-            session.add(log)
+    def test_flujo_tarjeta_con_score(self, session):
+        """Crear cliente con buen saldo → calcular score → emitir tarjeta crédito."""
+        ok, cliente = crear_cliente(session, "Cliente VIP", "Ahorro", 20000)
         session.commit()
-
-        alertas = verificar_intentos_login(session)
-        assert len(alertas) >= 1
-        assert alertas[0]["nivel"] == NIVEL_ERROR
-
-    def test_mora_calculada(self, session):
-        """Calcular mora para prestamo vencido."""
-        ok, _ = crear_cliente(session, "ClienteMora", "ahorro", 5000.0)
+        sc = calcular_score(session, cliente.id)
+        assert sc.score >= 500
+        ok, tc = emitir_tarjeta_credito(session, cliente.id, 10000)
         assert ok
-        c = session.query(Cliente).filter_by(nombre="Clientemora").first()
-        depositar(session, c.id, 2000.0)
-        otorgar_prestamo(session, c.id, 500.0, 12)
-        p = session.query(Prestamo).filter_by(cliente_id=c.id, estado="ACTIVO").first()
-        p_id  = p.id
-        p.fecha_vencimiento = datetime.now().date() - timedelta(days=30)
+        assert float(tc.limite) == pytest.approx(10000.0)
+
+    def test_flujo_beneficiario_y_transferencia(self, session, cliente_a, cliente_b):
+        """Agregar beneficiario → transferir → verificar historial."""
+        ok, b = agregar_beneficiario(session, cliente_a.id, cliente_b.num_cuenta, "Mi amigo")
+        assert ok
+        ok_t, msg_t = transferir(session, cliente_a.id, cliente_b.id, 200)
         session.commit()
+        assert ok_t
+        h = historial_cliente(session, cliente_a.id)
+        tipos = [m.tipo for m in h["movimientos"]]
+        assert "Transferencia Enviada" in tipos
+        bens = h["beneficiarios"]
+        assert len(bens) >= 1
 
-        # Nueva sesion limpia para evitar cache ORM
-        from sqlalchemy.orm import Session as S2
-        with S2(session.get_bind()) as s2:
-            n, msg = calcular_mora(s2)
-            assert n >= 1, f"got {n}: {msg}"
-            rows = s2.execute(__import__("sqlalchemy").text(
-                "SELECT mora_acumulada, dias_mora FROM prestamos WHERE id=:id"
-            ), {"id": p_id}).fetchone()
-            assert rows is not None
-            assert float(rows[0]) > 0, f"mora_acumulada={rows[0]}"
-            assert int(rows[1]) == 30
-    def test_todas_alertas_orden(self, session, cliente_a):
-        """Las alertas críticas (error) deben aparecer primero."""
-        caja = caja_real(session)
-        alertas = obtener_todas_alertas(session, caja)
-        niveles = [a["nivel"] for a in alertas]
-        # Si hay alertas, las de error deben estar antes que las de warning
-        if NIVEL_ERROR in niveles and NIVEL_WARNING in niveles:
-            idx_err  = min(i for i, n in enumerate(niveles) if n == NIVEL_ERROR)
-            idx_warn = min(i for i, n in enumerate(niveles) if n == NIVEL_WARNING)
-            assert idx_err < idx_warn
-
-    def test_umbral_alerta_configurable(self, session):
-        """Cambiar el umbral de saldo mínimo afecta las alertas."""
-        crear_cliente(session, "Cliente Medio", "ahorro", 200.0)
-        # Con el umbral default ($50) no hay alerta
-        alertas_antes = verificar_saldos_bajos(session)
-        nombres_antes = [a["extra"]["nombre"] for a in alertas_antes]
-        assert "Cliente Medio" not in nombres_antes
-
-        # Subir el umbral a $500
-        session.add(ConfigBanco(clave="alerta_saldo_minimo", valor="500.00"))
+    def test_cierre_diario_con_multiples_operaciones(self, session):
+        """Múltiples operaciones del día → cierre diario → verificar totales."""
+        ok, c1 = crear_cliente(session, "Cliente Cierre 1", "Ahorro", 2000)
+        ok, c2 = crear_cliente(session, "Cliente Cierre 2", "Ahorro", 1000)
         session.commit()
-
-        alertas_despues = verificar_saldos_bajos(session)
-        nombres_despues = [a["extra"]["nombre"] for a in alertas_despues]
-        assert "Cliente Medio" in nombres_despues
-
-
-# ══════════════════════════════════════════════════════════════
-# 7. TESTS DE EXPORTACIÓN
-# ══════════════════════════════════════════════════════════════
-
-class TestExportacion:
-
-    def test_estado_cuenta_pdf_genera_bytes(self, session, cliente_a):
-        depositar(session, cliente_a.id, 100.0)
-        movs = session.query(Movimiento).filter_by(cliente_id=cliente_a.id).all()
-        pdf = generar_estado_cuenta_pdf(cliente_a, movs)
-        assert isinstance(pdf, bytes)
-        assert len(pdf) > 1000  # PDF real, no vacío
-        assert pdf[:4] == b"%PDF"  # Magic bytes de PDF
-
-    def test_estado_cuenta_pdf_sin_movimientos(self, session, cliente_a):
-        """PDF debe generarse aunque no haya movimientos."""
-        pdf = generar_estado_cuenta_pdf(cliente_a, [])
-        assert isinstance(pdf, bytes)
-        assert pdf[:4] == b"%PDF"
-
-    def test_comprobante_pdf(self, session, cliente_a):
-        depositar(session, cliente_a.id, 100.0)
-        mov = session.query(Movimiento).filter_by(cliente_id=cliente_a.id).first()
-        pdf = generar_comprobante_pdf(mov, cliente_a)
-        assert isinstance(pdf, bytes)
-        assert pdf[:4] == b"%PDF"
-
-    def test_amortizacion_pdf(self, session, cliente_a):
-        depositar(session, cliente_a.id, 2000.0)
-        session.refresh(cliente_a)
-        otorgar_prestamo(session, cliente_a.id, 1000.0, 12)
-        p = session.query(Prestamo).filter_by(
-            cliente_id=cliente_a.id, estado="ACTIVO"
-        ).first()
-        cuotas = sorted(p.cuotas, key=lambda c: c.numero_cuota)
-        pdf = generar_amortizacion_pdf(p, cuotas, cliente_a)
-        assert isinstance(pdf, bytes)
-        assert pdf[:4] == b"%PDF"
-
-    def test_movimientos_csv_bytes(self, session, cliente_a):
-        depositar(session, cliente_a.id, 100.0)
-        retirar(session, cliente_a.id, 50.0)
-        movs = session.query(Movimiento).filter_by(cliente_id=cliente_a.id).all()
-        csv_bytes = generar_movimientos_csv(movs, cliente_a)
-        assert isinstance(csv_bytes, bytes)
-        contenido = csv_bytes.decode("utf-8-sig")
-        assert "Fecha" in contenido
-        assert "Tipo" in contenido
-        assert "Monto" in contenido
-
-    def test_csv_contiene_movimientos(self, session, cliente_a):
-        depositar(session, cliente_a.id, 250.0)
-        movs = session.query(Movimiento).filter_by(cliente_id=cliente_a.id).all()
-        csv_bytes = generar_movimientos_csv(movs, cliente_a)
-        contenido = csv_bytes.decode("utf-8-sig")
-        assert "Deposito" in contenido
-
-    def test_balance_csv(self):
-        cuentas = [
-            {"nombre": "Caja General",      "categoria": "ACTIVO",  "saldo": 5000.0},
-            {"nombre": "Capital Banco",      "categoria": "PATRIMONIO", "saldo": 10000.0},
-            {"nombre": "Depositos Clientes", "categoria": "PASIVO",  "saldo": 3000.0},
-        ]
-        csv_bytes = generar_balance_csv(cuentas)
-        assert isinstance(csv_bytes, bytes)
-        contenido = csv_bytes.decode("utf-8-sig")
-        assert "Caja General" in contenido
-        assert "5000.00" in contenido
-
-    def test_balance_pdf(self):
-        cuentas = [
-            {"nombre": "Caja General",      "categoria": "ACTIVO",  "saldo": 5000.0},
-            {"nombre": "Capital Banco",      "categoria": "PATRIMONIO", "saldo": 10000.0},
-        ]
-        pdf = generar_balance_pdf(cuentas)
-        assert isinstance(pdf, bytes)
-        assert pdf[:4] == b"%PDF"
-
-
-# ══════════════════════════════════════════════════════════════
-# 8. TESTS DE AUTENTICACIÓN Y USUARIOS
-# ══════════════════════════════════════════════════════════════
-
-class TestAuth:
-
-    def test_login_correcto(self, session, admin_user):
-        u, msg = login(session, "admin", "admin123")
-        assert u is not None
-        assert u.rol == "ADMIN"
-
-    def test_login_password_incorrecto(self, session, admin_user):
-        u, msg = login(session, "admin", "wrong")
-        assert u is None
-        assert "incorrecta" in msg.lower()
-
-    def test_login_usuario_no_existe(self, session):
-        u, msg = login(session, "nadie", "123456")
-        assert u is None
-
-    def test_login_registra_log(self, session, admin_user):
-        login(session, "admin", "admin123")
-        log = session.query(AuditLog).filter_by(
-            username="admin", accion="LOGIN"
-        ).first()
-        assert log is not None
-        assert log.resultado == "OK"
-
-    def test_login_fallido_registra_log(self, session, admin_user):
-        login(session, "admin", "wrong")
-        log = session.query(AuditLog).filter_by(
-            username="admin", accion="LOGIN_FALLIDO"
-        ).first()
-        assert log is not None
-        assert log.resultado == "ERROR"
-
-    def test_permisos_admin(self):
-        perms_admin = PERMISOS["ADMIN"]
-        assert "gestionar_usuarios" in perms_admin
-        assert "configurar_banco"   in perms_admin
-        assert "ver_alertas"        in perms_admin
-        assert "operaciones_bancarias" in perms_admin
-
-    def test_permisos_cajero_no_configura(self):
-        perms_cajero = PERMISOS["CAJERO"]
-        assert "configurar_banco"   not in perms_cajero
-        assert "gestionar_usuarios" not in perms_cajero
-
-    def test_permisos_auditor_solo_lectura(self):
-        perms_auditor = PERMISOS["AUDITOR"]
-        assert "operaciones_bancarias" not in perms_auditor
-        assert "gestionar_usuarios"    not in perms_auditor
-        assert "ver_reportes"          in perms_auditor
-
-    def test_crear_usuario_nuevo(self, session, admin_user):
-        ok, msg = crear_usuario(session, admin_user, "cajero1", "Juan Cajero", "pass123", "CAJERO")
-        assert ok
-        u = session.query(Usuario).filter_by(username="cajero1").first()
-        assert u is not None
-        assert u.rol == "CAJERO"
-
-    def test_no_crear_usuario_duplicado(self, session, admin_user):
-        crear_usuario(session, admin_user, "cajero1", "Juan Cajero", "pass123", "CAJERO")
-        ok, msg = crear_usuario(session, admin_user, "cajero1", "Otro Cajero", "pass456", "CAJERO")
-        assert not ok
-
-    def test_toggle_usuario(self, session, admin_user):
-        crear_usuario(session, admin_user, "temp", "Temporal", "pass123", "CAJERO")
-        temp = session.query(Usuario).filter_by(username="temp").first()
-        ok, _ = toggle_usuario(session, admin_user, temp.id)
-        assert ok
-        session.refresh(temp)
-        assert not temp.activo
-
-    def test_cambiar_rol(self, session, admin_user):
-        crear_usuario(session, admin_user, "user2", "Usuario Dos", "pass123", "CAJERO")
-        u = session.query(Usuario).filter_by(username="user2").first()
-        ok, _ = cambiar_rol(session, admin_user, u.id, "GERENTE")
-        assert ok
-        session.refresh(u)
-        assert u.rol == "GERENTE"
-
-    def test_usuario_desactivado_no_puede_login(self, session, admin_user):
-        crear_usuario(session, admin_user, "inactivo", "Inactivo", "pass123", "CAJERO")
-        u = session.query(Usuario).filter_by(username="inactivo").first()
-        toggle_usuario(session, admin_user, u.id)  # desactivar
-
-        resultado, msg = login(session, "inactivo", "pass123")
-        assert resultado is None
-        assert "desactivado" in msg.lower()
-
-
-# ══════════════════════════════════════════════════════════════
-# 9. TESTS DE INTEGRACIÓN (flujos completos)
-# ══════════════════════════════════════════════════════════════
-
-class TestIntegracion:
-
-    def test_flujo_completo_cliente_nuevo(self, session):
-        """Crear cliente → depositar → transferir → préstamo → pagar."""
-        ok, _ = crear_cliente(session, "Integra A", "ahorro", 2000.0)
-        assert ok
-        ok, _ = crear_cliente(session, "Integra B", "ahorro", 100.0)
-        assert ok
-
-        a = session.query(Cliente).filter_by(nombre="Integra A").first()
-        b = session.query(Cliente).filter_by(nombre="Integra B").first()
-
-        # Depositar
-        ok, _ = depositar(session, a.id, 500.0)
-        assert ok
-
-        # Transferir a B
-        ok, _ = transferir(session, a.id, b.id, 200.0)
-        assert ok
-
-        # Préstamo
-        ok, _ = otorgar_prestamo(session, a.id, 300.0, 6)
-        assert ok
-
-        # Pago parcial
-        ok, _ = pagar_prestamo(session, a.id, 50.0)
-        assert ok
-
-        # Balance debe cuadrar
-        errores, lines = reconciliar(session)
-        assert errores == 0, "\n".join(lines)
-
-    def test_exportar_despues_de_operaciones(self, session):
-        """Generar PDF y CSV después de varias operaciones."""
-        crear_cliente(session, "Export Test", "ahorro", 1000.0)
-        c = session.query(Cliente).filter_by(nombre="Export Test").first()
-
-        depositar(session, c.id, 200.0)
-        retirar(session,  c.id, 50.0)
-        otorgar_prestamo(session, c.id, 300.0, 12)
-
-        movs = session.query(Movimiento).filter_by(cliente_id=c.id).all()
-
-        pdf = generar_estado_cuenta_pdf(c, movs)
-        csv_b = generar_movimientos_csv(movs, c)
-
-        assert pdf[:4] == b"%PDF"
-        assert b"Export Test" in pdf or len(pdf) > 2000
-        assert b"Export Test" in csv_b
-
-    def test_alertas_despues_de_mora(self, session):
-        """Prestamo vencido genera alertas y mora calculada."""
-        ok, _ = crear_cliente(session, "Moroso", "ahorro", 3000.0)
-        assert ok
-        c = session.query(Cliente).filter_by(nombre="Moroso").first()
-        depositar(session, c.id, 500.0)
-        otorgar_prestamo(session, c.id, 500.0, 12)
-        p = session.query(Prestamo).filter_by(cliente_id=c.id, estado="ACTIVO").first()
-        p.fecha_vencimiento = datetime.now().date() - timedelta(days=60)
+        depositar(session, c1.id, 500)
+        retirar(session, c1.id, 100)
+        transferir(session, c1.id, c2.id, 200)
         session.commit()
+        ok, cierre = realizar_cierre_diario(session, "AdminCierre", "Cierre end-to-end")
+        assert ok
+        assert float(cierre.total_depositos) >= 500
+        assert float(cierre.total_retiros) >= 100
 
-        # Nueva sesion limpia
-        from sqlalchemy.orm import Session as S2
-        from sqlalchemy import text as sqlt
-        with S2(session.get_bind()) as s2:
-            n, msg = calcular_mora(s2)
-            assert n >= 1, f"mora no calculada: {msg}"
-
-            # Verificar directamente en BD
-            row = s2.execute(sqlt(
-                "SELECT mora_acumulada FROM prestamos WHERE estado='ACTIVO' AND mora_acumulada > 0"
-            )).fetchone()
-            assert row is not None, "Ninguna fila con mora > 0 en BD"
-
-            # Alertas de prestamos vencidos
-            alertas = verificar_prestamos_vencidos(s2)
-            assert any(a["extra"]["cliente"] == "Moroso" for a in alertas), \
-                "Moroso no aparece en alertas vencidos"
-
-            # Alertas de mora activa (usa SQL directo internamente)
-            mora_alertas = verificar_mora_activa(s2)
-            assert any(a["extra"]["cliente"] == "Moroso" for a in mora_alertas), \
-                f"Moroso no en mora_alertas. BD row={row}, alertas={mora_alertas}"
-    def test_configuracion_afecta_operaciones(self, session):
-        """Cambiar tasas y verificar que el balance sigue cuadrado."""
-        # Subir tasa de depósito al 5%
-        session.add(ConfigBanco(clave="tasa_deposito",      valor="0.05"))
-        session.add(ConfigBanco(clave="tasa_transferencia", valor="0.02"))
+    def test_stress_extras_100_operaciones(self, session):
+        """100 operaciones mixtas sin errores ni balance roto."""
+        ok, c1 = crear_cliente(session, "Stress Extra A", "Ahorro", 100000)
+        ok, c2 = crear_cliente(session, "Stress Extra B", "Ahorro", 100000)
         session.commit()
-
-        crear_cliente(session, "Config A", "ahorro", 500.0)
-        crear_cliente(session, "Config B", "ahorro", 500.0)
-        a = session.query(Cliente).filter_by(nombre="Config A").first()
-        b = session.query(Cliente).filter_by(nombre="Config B").first()
-
-        depositar(session, a.id, 300.0)
-        transferir(session, a.id, b.id, 50.0)
-
-        errores, lines = reconciliar(session)
-        assert errores == 0, "\n".join(lines)
+        for i in range(50):
+            depositar(session, c1.id, 100)
+        for i in range(30):
+            retirar(session, c1.id, 50)
+        for i in range(20):
+            transferir(session, c1.id, c2.id, 75)
+        session.commit()
+        bg = generar_balance_general(session)
+        assert bg["ecuacion_ok"]

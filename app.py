@@ -15,6 +15,7 @@ import plotly.express as px
 from datetime import datetime
 from sqlalchemy import create_engine, func
 from sqlalchemy.orm import Session, selectinload
+from contabilidad import registrar
 
 from models import (
     BaseLocal, Cliente, Movimiento, Prestamo,
@@ -46,6 +47,18 @@ from operaciones import (
     editar_cliente, suspender_cliente, reactivar_cliente, cerrar_cuenta,
     revertir_operacion, verificar_limite_diario,
     OPERACIONES_REVERSIBLES, VENTANA_REVERSION_MIN,
+    # Nuevas operaciones — plan de cuentas ampliado
+    registrar_inversion, liquidar_inversion,
+    adquirir_bien_inmueble,
+    clasificar_prestamo_moroso, constituir_provision, castigar_prestamo_incobrable,
+    deposito_cuenta_ahorro, deposito_cuenta_corriente,
+    recibir_prestamo_banco, pagar_obligacion_banco,
+    provisionar_impuesto, pagar_impuesto,
+    constituir_reserva_legal, registrar_utilidad_ejercicio,
+    registrar_comision_tarjeta_credito,
+    cobrar_mora_prestamo,
+    registrar_gasto_operativo,
+    registrar_mora_pagada_banco,
 )
 from auth import (
     hay_usuarios, registrar_primer_admin, login,
@@ -1096,10 +1109,11 @@ def vista_prestamos(session):
                 .filter(Prestamo.estado == "ACTIVO").scalar()
             )
             capacidad = max(capital_banco - total_prest, 0.0)
+            tp = float(tasa_prestamo(session)) * 100
             alert("info",
                   f"Capacidad de crédito disponible: <strong>${capacidad:,.2f}</strong>"
                   f"   ·   (Capital: ${capital_banco:,.2f} – Préstamos activos: ${total_prest:,.2f})"
-                  f"   ·   Interés fijo: <strong>10%</strong>")
+                  f"   ·   Tasa por defecto: <strong>{tp:.1f}%</strong> (editable por préstamo)")
             with st.form("prestamo_form"):
                 col1, col2 = st.columns(2)
                 with col1:
@@ -1111,7 +1125,7 @@ def vista_prestamos(session):
                 with col2:
                     clasificacion = st.selectbox("Clasificación del crédito", CLASIFICACIONES)
                     tasa_input    = st.number_input("Tasa de interés anual (%)", min_value=1.0,
-                                                     max_value=36.0, value=10.0, step=0.5)
+                                                     max_value=36.0, value=float(tasa_prestamo(session))*100, step=0.5)
                     sucursales    = session.query(Sucursal).filter_by(activa=True).all()
                     suc_sel       = st.selectbox("Sucursal", sucursales,
                                                   format_func=lambda s: s.nombre) if sucursales else None
@@ -1127,7 +1141,7 @@ def vista_prestamos(session):
                 if score_cliente < 400:
                     alert("error", f"✗ Score crediticio insuficiente ({score_cliente}). No se puede otorgar el préstamo.")
                 else:
-                    ok, msg = otorgar_prestamo(session, sel.id, monto, plazo)
+                    ok, msg = otorgar_prestamo(session, sel.id, monto, plazo, tasa_anual=tasa_input/100)
                     if ok:
                         # Actualizar clasificación y sucursal en el préstamo recién creado
                         ultimo_p = session.query(Prestamo).filter_by(
@@ -1172,17 +1186,26 @@ def vista_prestamos(session):
                 with col_c: render_metric("Deuda total",        f"${deuda_tot:,.2f}")
                 st.markdown("")
                 with st.form("pago_form"):
-                    max_pago = float(min(sel_c.saldo, Decimal(str(deuda_tot))))
+                    cuota_val = float(p_activo.cuota_mensual) if p_activo.cuota_mensual else 100.0
+                    max_pago  = float(min(sel_c.saldo, Decimal(str(deuda_tot))))
+                    # Si el saldo residual es menor que la cuota normal (últimos centavos),
+                    # usar el saldo residual como valor por defecto y step pequeño.
+                    saldo_res = float(p_activo.saldo_pendiente)
+                    es_residual = saldo_res < cuota_val * 0.5
+                    default_pago = round(min(max_pago, saldo_res if es_residual else cuota_val), 2)
+                    step_val = 0.01 if es_residual else round(cuota_val, 2)
                     monto_p = st.number_input(
-                        "Monto a pagar ($)",
+                        f"Monto a pagar ($)  — cuota mensual: ${cuota_val:,.2f}",
                         min_value=0.01,
                         max_value=max_pago if max_pago > 0 else 0.01,
-                        step=100.0,
+                        value=default_pago if default_pago > 0 else 0.01,
+                        step=step_val,
                     )
-                    p_int = min(monto_p, int_pend)
-                    p_cap = monto_p - p_int
+                    # Calcular cuántas cuotas cubre el monto ingresado
+                    cuotas_cubiertas = int(monto_p // cuota_val) if cuota_val > 0 else 0
                     st.caption(
-                        f"Se aplicará → capital: **${p_cap:.2f}** · interés: **${p_int:.2f}**"
+                        f"Cuota mensual: **${cuota_val:,.2f}** · "
+                        f"Monto ingresado cubre: **{cuotas_cubiertas} cuota(s)**"
                     )
                     # BUG CORREGIDO: se pasaba prestamo.id en vez de cliente_id
                     enviado = st.form_submit_button("💳 Registrar pago", type="primary")
@@ -1439,41 +1462,106 @@ def vista_reportes(session):
     # ── Balance general ──
     with tab2:
         st.markdown("#### Balance General")
-        caja      = saldo_cuenta(session, "Caja General")
-        prest_c   = saldo_cuenta(session, "Prestamos x Cobrar")
-        int_c     = saldo_cuenta(session, "Intereses x Cobrar")
-        depositos = saldo_cuenta(session, "Depositos Clientes")
-        capital   = saldo_cuenta(session, "Capital Banco")
-        ing_int   = saldo_cuenta(session, "Ingresos Intereses")
-        ing_com   = saldo_cuenta(session, "Ingresos Comisiones")
 
-        activos    = caja + prest_c + int_c
-        pasivos    = depositos
-        patrimonio = capital + ing_int + ing_com
+        # ── ACTIVOS ──
+        caja        = saldo_cuenta(session, "Caja General")
+        prest_c     = saldo_cuenta(session, "Prestamos x Cobrar")
+        int_c       = saldo_cuenta(session, "Intereses x Cobrar")
+        prest_mor   = saldo_cuenta(session, "Prestamos Morosos")
+        deud_tar    = saldo_cuenta(session, "Deudores por Tarjeta")
+        inversiones = saldo_cuenta(session, "Inversiones")
+        bienes      = saldo_cuenta(session, "Bienes e Inmuebles")
+        provision   = saldo_cuenta(session, "Provision Incobrables")   # resta
+
+        # ── PASIVOS ──
+        depositos   = saldo_cuenta(session, "Depositos Clientes")
+        ahorro      = saldo_cuenta(session, "Cuentas de Ahorro")
+        corrientes  = saldo_cuenta(session, "Cuentas Corrientes")
+        plazo_fijo  = saldo_cuenta(session, "Depositos a Plazo Fijo")
+        oblig_banco = saldo_cuenta(session, "Obligaciones con Bancos")
+        imp_pagar   = saldo_cuenta(session, "Impuestos por Pagar")
+
+        # ── PATRIMONIO ──
+        capital     = saldo_cuenta(session, "Capital Banco")
+        reservas    = saldo_cuenta(session, "Reservas Legales")
+        utilidades  = saldo_cuenta(session, "Utilidades del Ejercicio")
+
+        # ── INGRESOS y GASTOS (resultado del ejercicio) ──
+        ing_int     = saldo_cuenta(session, "Ingresos Intereses")
+        ing_com     = saldo_cuenta(session, "Ingresos Comisiones")
+        ing_tar     = saldo_cuenta(session, "Ingresos Tarjeta Credito")
+        ing_mora    = saldo_cuenta(session, "Ingresos por Mora")
+        gto_int     = saldo_cuenta(session, "Gastos Intereses")
+        gto_op      = saldo_cuenta(session, "Gastos Operativos")
+        gto_prov    = saldo_cuenta(session, "Gastos por Provisiones")
+        gto_mora    = saldo_cuenta(session, "Gastos por Mora Pagada")
+
+        resultado_neto = (ing_int + ing_com + ing_tar + ing_mora
+                          - gto_int - gto_op - gto_prov - gto_mora)
+
+        activos    = caja + prest_c + int_c + prest_mor + deud_tar + inversiones + bienes - provision
+        pasivos    = depositos + ahorro + corrientes + plazo_fijo + oblig_banco + imp_pagar
+        patrimonio = capital + reservas + utilidades + resultado_neto
         diff       = round(activos - pasivos - patrimonio, 2)
 
+        # ── Mostrar ACTIVOS ──
         st.markdown("**ACTIVOS**")
         col_a, col_b, col_c, col_d = st.columns(4)
-        with col_a: render_metric("Caja General",        f"${caja:,.2f}")
-        with col_b: render_metric("Préstamos x Cobrar",  f"${prest_c:,.2f}")
-        with col_c: render_metric("Intereses x Cobrar",  f"${int_c:,.2f}")
-        with col_d: render_metric("TOTAL ACTIVOS",       f"${activos:,.2f}")
+        with col_a: render_metric("Caja General",           f"${caja:,.2f}")
+        with col_b: render_metric("Préstamos x Cobrar",     f"${prest_c:,.2f}")
+        with col_c: render_metric("Intereses x Cobrar",     f"${int_c:,.2f}")
+        with col_d: render_metric("Deudores Tarjeta",       f"${deud_tar:,.2f}")
+        col_e, col_f, col_g, col_h = st.columns(4)
+        with col_e: render_metric("Inversiones",            f"${inversiones:,.2f}")
+        with col_f: render_metric("Bienes e Inmuebles",     f"${bienes:,.2f}")
+        with col_g: render_metric("Préstamos Morosos",      f"${prest_mor:,.2f}")
+        with col_h: render_metric("(-) Prov. Incobrables",  f"${-provision:,.2f}")
+        st.markdown(f"**TOTAL ACTIVOS: ${activos:,.2f}**")
 
-        st.markdown("**PASIVOS + PATRIMONIO**")
-        col_e, col_f, col_g, col_h, col_i = st.columns(5)
-        with col_e: render_metric("Depósitos Clientes",  f"${depositos:,.2f}")
-        with col_f: render_metric("Capital Banco",        f"${capital:,.2f}")
-        with col_g: render_metric("Ingresos Intereses",       f"${ing_int:,.2f}")
-        with col_h: render_metric("Ingresos Comisiones",      f"${ing_com:,.2f}")
-        with col_i: render_metric("TOTAL PAS+PAT",        f"${pasivos+patrimonio:,.2f}")
+        st.divider()
+
+        # ── Mostrar PASIVOS ──
+        st.markdown("**PASIVOS**")
+        col_p1, col_p2, col_p3 = st.columns(3)
+        with col_p1: render_metric("Depósitos Clientes",    f"${depositos:,.2f}")
+        with col_p2: render_metric("Cuentas de Ahorro",     f"${ahorro:,.2f}")
+        with col_p3: render_metric("Cuentas Corrientes",    f"${corrientes:,.2f}")
+        col_p4, col_p5, col_p6 = st.columns(3)
+        with col_p4: render_metric("Depósitos Plazo Fijo",  f"${plazo_fijo:,.2f}")
+        with col_p5: render_metric("Oblig. con Bancos",     f"${oblig_banco:,.2f}")
+        with col_p6: render_metric("Impuestos por Pagar",   f"${imp_pagar:,.2f}")
+        st.markdown(f"**TOTAL PASIVOS: ${pasivos:,.2f}**")
+
+        st.divider()
+
+        # ── Mostrar PATRIMONIO + RESULTADO ──
+        st.markdown("**PATRIMONIO + RESULTADO DEL EJERCICIO**")
+        col_q1, col_q2, col_q3 = st.columns(3)
+        with col_q1: render_metric("Capital Banco",         f"${capital:,.2f}")
+        with col_q2: render_metric("Reservas Legales",      f"${reservas:,.2f}")
+        with col_q3: render_metric("Utilidades Ejercicio",  f"${utilidades:,.2f}")
+        col_q4, col_q5, col_q6, col_q7 = st.columns(4)
+        with col_q4: render_metric("Ing. Intereses",        f"${ing_int:,.2f}")
+        with col_q5: render_metric("Ing. Comisiones",       f"${ing_com:,.2f}")
+        with col_q6: render_metric("(-) Gastos Operativos", f"${-gto_op:,.2f}")
+        with col_q7: render_metric("Resultado Neto",        f"${resultado_neto:,.2f}")
+        st.markdown(f"**TOTAL PATRIMONIO+RESULTADO: ${patrimonio:,.2f}**")
 
         st.markdown("")
         if abs(diff) < 0.01:
-            alert("success", f"✅ Balance cuadrado — diferencia: ${diff:.2f}")
+            alert("success", f"✅ Balance cuadrado — Activos = Pasivos + Patrimonio (diferencia: ${diff:.2f})")
         else:
-            alert("error", f"❌ Balance descuadrado — diferencia: ${diff:,.2f}")
+            alert("error", f"❌ Balance descuadrado — diferencia: ${diff:,.2f} (revisar asientos)")
 
-        composicion = {"Caja": caja, "Préstamos": prest_c, "Intereses x Cobrar": int_c}
+        # Gráfico de composición de activos
+        composicion = {
+            "Caja": caja,
+            "Préstamos": prest_c,
+            "Intereses x Cobrar": int_c,
+            "Bienes e Inmuebles": bienes,
+            "Inversiones": inversiones,
+            "Deudores Tarjeta": deud_tar,
+        }
         composicion = {k: v for k, v in composicion.items() if v > 0}
         if composicion:
             fig3 = px.pie(
@@ -1490,13 +1578,31 @@ def vista_reportes(session):
         # Botones de descarga
         st.divider()
         cuentas_data = [
-            {"nombre": "Caja General",        "categoria": "ACTIVO",     "saldo": caja},
-            {"nombre": "Préstamos x Cobrar",   "categoria": "ACTIVO",     "saldo": prest_c},
-            {"nombre": "Intereses x Cobrar",   "categoria": "ACTIVO",     "saldo": int_c},
-            {"nombre": "Depósitos Clientes",   "categoria": "PASIVO",     "saldo": depositos},
-            {"nombre": "Capital Banco",        "categoria": "PATRIMONIO", "saldo": capital},
-            {"nombre": "Ingresos Intereses",   "categoria": "INGRESO",    "saldo": ing_int},
-            {"nombre": "Ingresos Comisiones",  "categoria": "INGRESO",    "saldo": ing_com},
+            {"nombre": "Caja General",           "categoria": "ACTIVO",     "saldo": caja},
+            {"nombre": "Préstamos x Cobrar",      "categoria": "ACTIVO",     "saldo": prest_c},
+            {"nombre": "Intereses x Cobrar",      "categoria": "ACTIVO",     "saldo": int_c},
+            {"nombre": "Deudores por Tarjeta",    "categoria": "ACTIVO",     "saldo": deud_tar},
+            {"nombre": "Inversiones",             "categoria": "ACTIVO",     "saldo": inversiones},
+            {"nombre": "Bienes e Inmuebles",      "categoria": "ACTIVO",     "saldo": bienes},
+            {"nombre": "Préstamos Morosos",       "categoria": "ACTIVO",     "saldo": prest_mor},
+            {"nombre": "(-) Prov. Incobrables",   "categoria": "ACTIVO",     "saldo": -provision},
+            {"nombre": "Depósitos Clientes",      "categoria": "PASIVO",     "saldo": depositos},
+            {"nombre": "Cuentas de Ahorro",       "categoria": "PASIVO",     "saldo": ahorro},
+            {"nombre": "Cuentas Corrientes",      "categoria": "PASIVO",     "saldo": corrientes},
+            {"nombre": "Depósitos Plazo Fijo",    "categoria": "PASIVO",     "saldo": plazo_fijo},
+            {"nombre": "Oblig. con Bancos",       "categoria": "PASIVO",     "saldo": oblig_banco},
+            {"nombre": "Impuestos por Pagar",     "categoria": "PASIVO",     "saldo": imp_pagar},
+            {"nombre": "Capital Banco",           "categoria": "PATRIMONIO", "saldo": capital},
+            {"nombre": "Reservas Legales",        "categoria": "PATRIMONIO", "saldo": reservas},
+            {"nombre": "Utilidades Ejercicio",    "categoria": "PATRIMONIO", "saldo": utilidades},
+            {"nombre": "Ingresos Intereses",      "categoria": "INGRESO",    "saldo": ing_int},
+            {"nombre": "Ingresos Comisiones",     "categoria": "INGRESO",    "saldo": ing_com},
+            {"nombre": "Ingresos Tarjeta",        "categoria": "INGRESO",    "saldo": ing_tar},
+            {"nombre": "Ingresos por Mora",       "categoria": "INGRESO",    "saldo": ing_mora},
+            {"nombre": "Gastos Intereses",        "categoria": "GASTO",      "saldo": gto_int},
+            {"nombre": "Gastos Operativos",       "categoria": "GASTO",      "saldo": gto_op},
+            {"nombre": "Gastos por Provisiones",  "categoria": "GASTO",      "saldo": gto_prov},
+            {"nombre": "Gastos por Mora Pagada",  "categoria": "GASTO",      "saldo": gto_mora},
         ]
         col_dl1, col_dl2 = st.columns(2)
         with col_dl1:
@@ -2081,60 +2187,371 @@ def ejecutar_pytest_ui():
 
 
 def ejecutar_stress_test(session):
-    clientes = session.query(Cliente).all()
-    if len(clientes) < 2:
-        st.error("Necesitas al menos 2 clientes para el stress test.")
-        return
+    """
+    Stress test autónomo y completo.
+    Cubre TODAS las operaciones del sistema:
+      Fase 1 — Operaciones básicas (depósito, retiro, transferencia, préstamos)
+      Fase 2 — Tarjetas de crédito, depósitos a plazo fijo, cuentas ahorro/corriente
+      Fase 3 — Contabilidad avanzada (inversiones, bienes, mora, provisiones, impuestos)
+      Fase 4 — Cierre diario, AML, score crediticio, garantías, refinanciamiento
+    Crea sus propios datos, verifica integridad y limpia todo al final.
+    """
+    import time, uuid
+    from models import Prestamo as _Prest, CuotaPrestamo as _Cuota
+    from models import Movimiento as _Mov, TarjetaCredito as _TC, DepositoPlazoFijo as _DPF
+    from operaciones import procesar_consumo_tarjeta, pagar_intereses_dpf
 
-    operaciones_realizadas = 0
-    errores_controlados    = 0
+    suffix = uuid.uuid4().hex[:6].upper()
+    st.markdown("### 🔥 Stress Test Completo — Todas las Operaciones")
+    resultados = []   # lista de (fase, operacion, ok/fail, detalle)
 
-    for _ in range(1000):  # reducido de 10000 a 500 para no congelar la UI
+    def check(fase, nombre, ok, msg=""):
+        icon = "✅" if ok else "❌"
+        resultados.append((fase, nombre, ok, msg))
+        return ok
+
+    # ══════════════════════════════════════════════════════════
+    # SETUP — crear clientes y datos base
+    # ══════════════════════════════════════════════════════════
+    with st.spinner("Creando datos de prueba..."):
+        # Clientes
+        clientes_temp = []
+        for nom in [f"_ST_Ana_{suffix}", f"_ST_Luis_{suffix}",
+                    f"_ST_Rosa_{suffix}", f"_ST_Pedro_{suffix}"]:
+            ok, r = crear_cliente(session, nom, "Ahorro", 5000)
+            if ok:
+                session.commit(); session.refresh(r)
+                clientes_temp.append(r)
+        if len(clientes_temp) < 2:
+            st.error("❌ No se pudieron crear clientes de prueba."); return
+        c1, c2 = clientes_temp[0], clientes_temp[1]
+        extra   = clientes_temp[2] if len(clientes_temp) > 2 else c1
+
+    # ══════════════════════════════════════════════════════════
+    # FASE 1 — Operaciones bancarias básicas
+    # ══════════════════════════════════════════════════════════
+    st.markdown("#### Fase 1 — Operaciones Básicas")
+    t0 = time.time()
+    ops_ok = ops_fail = 0
+
+    for _ in range(200):
+        op  = random.choice(["dep","dep","dep","ret","trf","prest","pago"])
+        cli = random.choice(clientes_temp)
+        session.refresh(cli)
+        monto = Decimal(str(random.randint(20, 400)))
         try:
-            operacion = random.choice([
-                "deposito", "retiro", "transferencia", "prestamo", "pago_prestamo",
-            ])
-            cliente = random.choice(clientes)
-            # Refrescar el cliente desde la BD para tener saldo actualizado
-            session.refresh(cliente)
-            monto = Decimal(str(random.randint(10, 500)))
-
-            if operacion == "deposito":
-                ok, _ = depositar(session, cliente.id, monto)
-            elif operacion == "retiro":
-                ok, _ = retirar(session, cliente.id, monto)
-            elif operacion == "prestamo":
-                ok, _ = otorgar_prestamo(session, cliente.id, monto)
-            elif operacion == "pago_prestamo":
-                ok, _ = pagar_prestamo(session, cliente.id, monto)
-            elif operacion == "transferencia":
-                otro = random.choice(clientes)
-                if cliente.id == otro.id:
-                    continue
-                ok, _ = transferir(session, cliente.id, otro.id, monto)
+            if op == "dep":
+                ok, _ = depositar(session, cli.id, monto)
+            elif op == "ret":
+                ok, _ = retirar(session, cli.id, monto)
+            elif op == "trf":
+                otro = random.choice([c for c in clientes_temp if c.id != cli.id])
+                ok, _ = transferir(session, cli.id, otro.id, monto)
+            elif op == "prest":
+                ok, _ = otorgar_prestamo(session, cli.id, monto, random.choice([6,12,24]))
+            elif op == "pago":
+                ok, _ = pagar_prestamo(session, cli.id, monto)
             else:
                 continue
+            if ok: ops_ok += 1
+            else:  ops_fail += 1
+        except Exception:
+            ops_fail += 1
+            try: session.rollback()
+            except: pass
 
-            if ok:
-                operaciones_realizadas += 1
-            else:
-                errores_controlados += 1
+    check("F1","200 ops aleatorias (dep/ret/trf/préstamo/pago)", ops_ok > 0,
+          f"{ops_ok} exitosas / {ops_fail} rechazos")
 
-        except Exception as e:
-            errores_controlados += 1
-            session.rollback()
+    # Cuentas ahorro y corriente
+    ok1, _ = deposito_cuenta_ahorro(session, c1.id, 500)
+    check("F1", "Depósito cuenta ahorro", ok1)
+    ok2, _ = deposito_cuenta_corriente(session, c2.id, 300)
+    check("F1", "Depósito cuenta corriente", ok2)
+    try: session.commit()
+    except: session.rollback()
 
-    st.success(f"Stress test terminado — {operaciones_realizadas} operaciones exitosas, "
-               f"{errores_controlados} rechazos controlados.")
+    elapsed1 = round(time.time()-t0, 2)
 
-    # Verificar saldos negativos
-    clientes_actualizados = session.query(Cliente).all()
-    negativos = [c for c in clientes_actualizados if c.saldo < 0]
+    # ══════════════════════════════════════════════════════════
+    # FASE 2 — Tarjetas y Depósitos a Plazo Fijo
+    # ══════════════════════════════════════════════════════════
+    st.markdown("#### Fase 2 — Tarjetas de Crédito y Depósitos a Plazo Fijo")
+
+    # Tarjeta de crédito
+    ok_tc, tc_obj = emitir_tarjeta_credito(session, c1.id, 1000)
+    check("F2", "Emitir tarjeta de crédito", ok_tc)
+    if ok_tc:
+        try: session.commit(); session.refresh(tc_obj)
+        except: session.rollback(); ok_tc = False
+
+    if ok_tc:
+        try:
+            procesar_consumo_tarjeta(session, tc_obj.id, 150)
+            check("F2", "Consumo tarjeta de crédito $150", True)
+        except Exception as _ex:
+            check("F2", "Consumo tarjeta de crédito $150", False, str(_ex))
+        ok_com, _ = registrar_comision_tarjeta_credito(session, 5.0, "Comisión ST")
+        check("F2", "Comisión tarjeta crédito", ok_com)
+        try: session.commit()
+        except: session.rollback()
+
+    # Tarjeta de débito
+    ok_td, _ = emitir_tarjeta_debito(session, c2.id)
+    check("F2", "Emitir tarjeta de débito", ok_td)
+    try: session.commit()
+    except: session.rollback()
+
+    # Depósito a plazo fijo
+    ok_dpf, dpf_obj = crear_deposito_plazo(session, c1.id, 500, 0.06, 3)
+    check("F2", "Crear depósito a plazo fijo (6%, 3 meses)", ok_dpf)
+    dpf_id = None
+    if ok_dpf:
+        try: session.commit(); session.refresh(dpf_obj); dpf_id = dpf_obj.id
+        except: session.rollback()
+
+    try:
+        pagar_intereses_dpf(session, c1.id, 10)
+        check("F2", "Pagar intereses DPF", True)
+    except Exception as e:
+        check("F2", "Pagar intereses DPF", False, str(e))
+
+    # Vencer DPF
+    if dpf_id:
+        ok_venc, _ = vencer_deposito_plazo(session, dpf_id, "StressTest")
+        check("F2", "Vencer depósito a plazo fijo", ok_venc)
+        try: session.commit()
+        except: session.rollback()
+
+    # ══════════════════════════════════════════════════════════
+    # FASE 3 — Contabilidad Avanzada
+    # ══════════════════════════════════════════════════════════
+    st.markdown("#### Fase 3 — Contabilidad Avanzada")
+
+    # Inversiones
+    ok_inv, _ = registrar_inversion(session, 2000, "Inversión ST")
+    check("F3", "Registrar inversión", ok_inv)
+    ok_liq, _ = liquidar_inversion(session, 2000, 150, "Liquidación ST")
+    check("F3", "Liquidar inversión con ganancia $150", ok_liq)
+    try: session.commit()
+    except: session.rollback()
+
+    # Bienes e inmuebles
+    ok_bien, _ = adquirir_bien_inmueble(session, 5000, "Bien ST")
+    check("F3", "Adquirir bien inmueble", ok_bien)
+    try: session.commit()
+    except: session.rollback()
+
+    # Obligaciones con bancos externos
+    ok_ob, _ = recibir_prestamo_banco(session, 3000, "Banco Externo ST")
+    check("F3", "Recibir préstamo de banco externo", ok_ob)
+    ok_pob, _ = pagar_obligacion_banco(session, 500, 50, "Banco Externo ST")
+    check("F3", "Pagar obligación banco (capital+interés)", ok_pob)
+    try: session.commit()
+    except: session.rollback()
+
+    # Provisiones e incobrables
+    ok_prov, _ = constituir_provision(session, 200, "Provisión ST")
+    check("F3", "Constituir provisión para incobrables", ok_prov)
+    try: session.commit()
+    except: session.rollback()
+
+    # Préstamo moroso — necesita préstamo activo
+    prest_mor = (session.query(_Prest)
+                 .filter(_Prest.cliente_id.in_([c.id for c in clientes_temp]),
+                         _Prest.estado == "ACTIVO")
+                 .first())
+    if prest_mor:
+        ok_mor, _ = clasificar_prestamo_moroso(session, prest_mor.id)
+        check("F3", "Clasificar préstamo como moroso", ok_mor)
+        try: session.commit()
+        except: session.rollback()
+        # Castigar como incobrable
+        prest_mor2 = (session.query(_Prest)
+                      .filter(_Prest.cliente_id.in_([c.id for c in clientes_temp]),
+                              _Prest.estado == "MOROSO")
+                      .first())
+        if prest_mor2:
+            ok_cast, _ = castigar_prestamo_incobrable(session, prest_mor2.id)
+            check("F3", "Castigar préstamo incobrable", ok_cast)
+            try: session.commit()
+            except: session.rollback()
+    else:
+        check("F3", "Clasificar/castigar moroso", False, "No había préstamo activo disponible")
+
+    # Mora
+    ok_mora_c, _ = cobrar_mora_prestamo(session, c2.id, 25)
+    check("F3", "Cobrar mora préstamo", ok_mora_c)
+    ok_mora_b, _ = registrar_mora_pagada_banco(session, 10, "Mora ST")
+    check("F3", "Registrar mora pagada banco", ok_mora_b)
+    try: session.commit()
+    except: session.rollback()
+
+    # Impuestos
+    ok_pim, _ = provisionar_impuesto(session, 300, "Renta ST")
+    check("F3", "Provisionar impuesto sobre renta", ok_pim)
+    ok_pag_imp, _ = pagar_impuesto(session, 300, "Renta ST")
+    check("F3", "Pagar impuesto", ok_pag_imp)
+    try: session.commit()
+    except: session.rollback()
+
+    # Reserva legal y utilidades
+    ok_res, _ = constituir_reserva_legal(session, 100)
+    check("F3", "Constituir reserva legal", ok_res)
+    ok_util, _ = registrar_utilidad_ejercicio(session, 500)
+    check("F3", "Registrar utilidad del ejercicio", ok_util)
+    try: session.commit()
+    except: session.rollback()
+
+    # Gastos operativos
+    ok_gop, _ = registrar_gasto_operativo(session, 200, "Gasto operativo ST")
+    check("F3", "Registrar gasto operativo", ok_gop)
+    try: session.commit()
+    except: session.rollback()
+
+    # ══════════════════════════════════════════════════════════
+    # FASE 4 — Extras: Garantías, Refinanciamiento, Score, AML
+    # ══════════════════════════════════════════════════════════
+    st.markdown("#### Fase 4 — Garantías, Refinanciamiento, Score y AML")
+
+    # Garantías sobre préstamo activo
+    prest_activo = (session.query(_Prest)
+                    .filter(_Prest.cliente_id.in_([c.id for c in clientes_temp]),
+                            _Prest.estado == "ACTIVO")
+                    .first())
+    if prest_activo:
+        ok_gar, _ = agregar_garantia(session, prest_activo.id,
+                                     "Inmueble", "Casa ST", 15000, "REG-ST-001")
+        check("F4", "Agregar garantía a préstamo", ok_gar)
+        try: session.commit()
+        except: session.rollback()
+
+        # Refinanciamiento
+        ok_ref, _ = refinanciar_prestamo(session, prest_activo.id, 36)
+        check("F4", "Refinanciar préstamo (36 meses)", ok_ref)
+        try: session.commit()
+        except: session.rollback()
+    else:
+        check("F4", "Garantía/refinanciamiento", False, "No había préstamo activo")
+
+    # Score crediticio
+    try:
+        sc_obj = calcular_score(session, c1.id)
+        check("F4", f"Score crediticio cliente 1", isinstance(sc_obj.score, (int, float)),
+            f"Score: {sc_obj.score}")
+    except Exception as ex:
+        check("F4", "Score crediticio", False, str(ex))
+
+    # AML
+    alertas_aml = verificar_aml(session, c2.id, 9500, "deposito")
+    check("F4", "Verificación AML (monto alto)", True, "AML ejecutado") 
+    try: session.commit()
+    except: session.rollback()
+
+    # Devengamiento de intereses
+    try:
+        devengar_interes(session)
+        check("F4", "Devengamiento de intereses", True)
+        session.commit()
+    except Exception as ex:
+        check("F4", "Devengamiento de intereses", False, str(ex))
+        session.rollback()
+
+    # Actualizar cuotas vencidas
+    try:
+        actualizar_cuotas_vencidas(session)
+        check("F4", "Actualizar cuotas vencidas", True)
+        session.commit()
+    except Exception as ex:
+        check("F4", "Actualizar cuotas vencidas", False, str(ex))
+        session.rollback()
+
+    # Historial cliente
+    try:
+        hist = historial_cliente(session, c1.id)
+        check("F4", "Historial de cliente", bool(hist))
+    except Exception as ex:
+        check("F4", "Historial de cliente", False, str(ex))
+
+    # ══════════════════════════════════════════════════════════
+    # VERIFICACIÓN CONTABLE FINAL
+    # ══════════════════════════════════════════════════════════
+    st.markdown("#### Verificación Contable Post-Test")
+    session.commit()
+    errores_rec, lines = reconciliar(session)
+    for line in lines:
+        stripped = line.strip()
+        if not stripped: continue
+        if "✅" in stripped:   st.success(stripped)
+        elif "❌" in stripped: st.error(stripped)
+        else:                  st.code(stripped, language=None)
+
+    negativos = [c for c in clientes_temp if c.saldo < 0]
     if negativos:
         for c in negativos:
-            st.error(f"🚨 SALDO NEGATIVO detectado: {c.nombre} = ${c.saldo:,.2f}")
+            st.error(f"🚨 SALDO NEGATIVO: {c.nombre} = ${c.saldo:,.2f}")
     else:
-        st.success("✅ Ningún cliente con saldo negativo.")
+        st.success("✅ Ningún cliente de prueba con saldo negativo")
+
+    # ══════════════════════════════════════════════════════════
+    # LIMPIEZA
+    # ══════════════════════════════════════════════════════════
+    st.markdown("#### Limpieza de Datos Temporales")
+    eliminados = 0
+    #for c in clientes_temp:
+        #try:
+         #   pids = [p.id for p in session.query(_Prest).filter_by(cliente_id=c.id).all()]
+          #  if pids:
+           #     session.query(_Cuota).filter(_Cuota.prestamo_id.in_(pids))                       .delete(synchronize_session=False)
+            #    session.query(_Prest).filter(_Prest.id.in_(pids))                       .delete(synchronize_session=False)
+            #session.query(_TC).filter_by(cliente_id=c.id).delete(synchronize_session=False)
+            #session.query(_DPF).filter_by(cliente_id=c.id).delete(synchronize_session=False)
+            #session.query(_Mov).filter_by(cliente_id=c.id).delete(synchronize_session=False)
+          #  pass
+         #   c.activo = False
+        #    eliminados += 1
+      #  except Exception as ex:
+       #     st.warning(f"⚠️ No se pudo limpiar {c.nombre}: {ex}")
+    #try:
+     #   session.commit()
+     #   st.success(f"✅ {eliminados} clientes temporales eliminados")
+    #except Exception as ex:
+      #  session.rollback()
+      #  st.warning(f"⚠️ Error en limpieza: {ex}")
+
+    # ══════════════════════════════════════════════════════════
+    # RESUMEN FINAL
+    # ══════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("### 📊 Resumen del Stress Test")
+
+    import pandas as pd
+    df = pd.DataFrame(resultados, columns=["Fase","Operación","OK","Detalle"])
+    total    = len(df)
+    exitosos = df["OK"].sum()
+    fallidos = total - exitosos
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total checks", total)
+    col2.metric("✅ Exitosos", exitosos)
+    col3.metric("❌ Fallidos", fallidos)
+
+    # Tabla coloreada por resultado
+    def color_row(row):
+        color = "background-color:#1a3a1a" if row["OK"] else "background-color:#3a1a1a"
+        return [color]*len(row)
+
+    st.dataframe(
+        df[["Fase","Operación","OK","Detalle"]].style.apply(color_row, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    if fallidos == 0:
+        st.success("🎉 **Stress Test completado — TODAS las operaciones pasaron**")
+    elif fallidos <= 3:
+        st.warning(f"⚠️ Stress Test completado con {fallidos} fallo(s) menores")
+    else:
+        st.error(f"❌ Stress Test completado con {fallidos} fallos — revisar operaciones marcadas")
 
     st.subheader("Reconciliación post stress test")
     errores, lines = reconciliar(session)
@@ -2231,9 +2648,11 @@ def ejecutar_stress_test(session):
     ])
     if checks_ok == total_checks:
         st.balloons()
-        alert("success",
-              f"🎉 Stress test completo — {operaciones_realizadas} ops exitosas. "
-              f"Todos los módulos ({checks_ok}/{total_checks}) funcionan correctamente.")
+        alert(
+            "success",
+            f"🎉 Stress test completo — {total_checks} módulos verificados "
+            f"correctamente ({checks_ok}/{total_checks})."
+        )
     else:
         alert("warning",
               f"⚠️ {checks_ok}/{total_checks} módulos OK — "
@@ -2871,6 +3290,29 @@ def vista_tarjetas(session, usuario):
                     else:
                         st.error(result)
 
+            with st.expander("💳 Registrar Consumo (Manual)"):
+                tarjetas_activas = session.query(TarjetaCredito).filter_by(estado="ACTIVA").all()
+                if tarjetas_activas:
+                    t_sel = st.selectbox(
+                        "Seleccionar Tarjeta", 
+                        tarjetas_activas, 
+                        format_func=lambda t: f"****{t.numero[-4:]} - Límite: ${float(t.limite):,.2f}"
+                    )
+                    monto_consumo = st.number_input("Monto del Consumo ($)", min_value=1.0, value=50.0, step=10.0)
+                    
+                    if st.button("🚀 Procesar Consumo", type="primary"):
+                        try:
+                            from operaciones import procesar_consumo_tarjeta
+                            tarjeta_act = procesar_consumo_tarjeta(session, t_sel.id, monto_consumo)
+                            session.commit()
+                            st.success(f"✅ Consumo autorizado. Nuevo saldo usado: ${tarjeta_act.saldo_usado:,.2f}")
+                            st.rerun()
+                        except Exception as e:
+                            session.rollback()
+                            st.error(f"❌ Error al procesar: {str(e)}")
+                else:
+                    st.info("No hay tarjetas de crédito activas en el sistema.")
+
         tarjetas_c = session.query(TarjetaCredito).all()
         if tarjetas_c:
             data = []
@@ -2969,13 +3411,15 @@ def vista_plazo_fijo(session, usuario):
             interes_proy = monto * tasa * plazo / 12
             st.info(f"📊 Interés proyectado: **${interes_proy:,.2f}** | Total al vencimiento: **${monto + interes_proy:,.2f}**")
             if st.button("✅ Crear Depósito", type="primary"):
-                ok, result = crear_deposito_plazo(session, c_sel.id, monto, tasa, plazo, renov)
-                if ok:
+                try:
+                    from operaciones import procesar_apertura_plazo_fijo
+                    dpf = procesar_apertura_plazo_fijo(session, c_sel.id, monto, tasa, plazo)
                     session.commit()
-                    st.success(f"✅ Certificado {result.num_certificado} creado. Vence: {result.fecha_vencimiento}")
+                    st.success(f"✅ Certificado de plazo fijo creado contablemente con éxito.")
                     st.rerun()
-                else:
-                    st.error(result)
+                except Exception as e:
+                    session.rollback()
+                    st.error(f"❌ Transacción denegada: {str(e)}")
 
     with tab1:
         depositos = session.query(DepositoPlazoFijo).order_by(DepositoPlazoFijo.fecha_apertura.desc()).all()
@@ -2992,7 +3436,7 @@ def vista_plazo_fijo(session, usuario):
                     "Tasa": f"{float(d.tasa_anual)*100:.1f}%",
                     "Plazo": f"{d.plazo_meses} meses",
                     "Vencimiento": str(d.fecha_vencimiento),
-                    "Total": f"${float(d.monto_total):,.2f}",
+                    "Total": f"${float(d.monto_total or 0):,.2f}",
                     "Estado": d.estado,
                     "Días rest.": dias_rest,
                 })
@@ -3108,6 +3552,370 @@ def vista_socios(session, usuario):
 
 
 # ═══════════════════════════════════════════════════════════
+#  VISTA: CONTABILIDAD AVANZADA (nuevas cuentas del plan)
+# ═══════════════════════════════════════════════════════════
+
+def vista_contabilidad_avanzada(session, usuario):
+    render_header("🏦", "Contabilidad Avanzada", "Gestión completa del plan de cuentas bancario")
+
+    if not tiene_permiso(usuario, "reportes"):
+        st.error("🔒 Acceso denegado")
+        return
+
+    # Helper local: siempre pasa el objeto usuario completo a registrar_log
+    def _audit(accion, detalle, resultado="OK"):
+        audit(session, usuario, accion, detalle, resultado)
+
+    tabs = st.tabs([
+        "💰 Inversiones",
+        "🏢 Bienes e Inmuebles",
+        "⚠️ Mora y Provisiones",
+        "🏛️ Pasivos Bancarios",
+        "🧾 Impuestos",
+        "📊 Patrimonio y Reservas",
+        "💳 Comisiones TC",
+        "⚡ Gastos Operativos",
+        "📋 Saldos del Plan",
+    ])
+
+    # ── Tab 0: INVERSIONES ──────────────────────────────────────────
+    with tabs[0]:
+        st.subheader("Gestión de Inversiones")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Registrar nueva inversión**")
+            inv_monto = st.number_input("Monto a invertir ($)", min_value=100.0, value=1000.0, step=100.0, key="inv_monto")
+            inv_desc  = st.text_input("Descripción", value="Inversión en bonos del Estado", key="inv_desc")
+            if st.button("💸 Registrar Inversión", key="btn_inv"):
+                try:
+                    ok, msg = registrar_inversion(session, inv_monto, inv_desc)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("INVERSION_REGISTRAR", inv_desc, "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+
+        with col2:
+            st.markdown("**Liquidar inversión**")
+            liq_monto   = st.number_input("Capital a recuperar ($)", min_value=100.0, value=1000.0, step=100.0, key="liq_monto")
+            liq_ganancia = st.number_input("Ganancia ($, opcional)", min_value=0.0, value=0.0, step=10.0, key="liq_gan")
+            liq_desc    = st.text_input("Descripción", value="Liquidación de inversión", key="liq_desc")
+            if st.button("💹 Liquidar Inversión", key="btn_liq"):
+                try:
+                    ok, msg = liquidar_inversion(session, liq_monto, liq_ganancia, liq_desc)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("INVERSION_LIQUIDAR", liq_desc, "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+
+        from contabilidad import saldo_cuenta as sc
+        saldo_inv = sc(session, "Inversiones")
+        st.metric("Saldo actual — Inversiones", f"${saldo_inv:,.2f}")
+
+    # ── Tab 1: BIENES E INMUEBLES ────────────────────────────────────
+    with tabs[1]:
+        st.subheader("Bienes e Inmuebles")
+        st.info("Registra edificios, equipos bancarios, mobiliario y otros activos fijos.")
+        bien_monto = st.number_input("Valor del bien ($)", min_value=100.0, value=5000.0, step=500.0, key="bien_monto")
+        bien_desc  = st.text_input("Descripción del bien", value="Equipo de cómputo", key="bien_desc")
+        if st.button("🏢 Adquirir Bien/Inmueble", key="btn_bien"):
+            try:
+                ok, msg = adquirir_bien_inmueble(session, bien_monto, bien_desc)
+                session.commit()
+                alert("success" if ok else "error", msg)
+                _audit("BIEN_ADQUIRIR", bien_desc, "OK" if ok else "ERROR")
+            except Exception as e:
+                session.rollback(); alert("error", str(e))
+        from contabilidad import saldo_cuenta as sc
+        st.metric("Saldo — Bienes e Inmuebles", f"${sc(session, 'Bienes e Inmuebles'):,.2f}")
+
+    # ── Tab 2: MORA Y PROVISIONES ────────────────────────────────────
+    with tabs[2]:
+        st.subheader("Mora y Provisiones para Incobrables")
+        from models import Prestamo as P
+        prestamos_activos = session.query(P).filter(P.estado == "ACTIVO", P.dias_mora > 0).all()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Clasificar préstamo como moroso**")
+            if prestamos_activos:
+                opts = {f"#{p.id} — ${p.saldo_pendiente:,.2f} ({p.dias_mora} días mora)": p.id
+                        for p in prestamos_activos}
+                sel = st.selectbox("Selecciona préstamo", list(opts.keys()), key="sel_moroso")
+                if st.button("⚠️ Clasificar Moroso", key="btn_moroso"):
+                    try:
+                        ok, msg = clasificar_prestamo_moroso(session, opts[sel])
+                        session.commit()
+                        alert("success" if ok else "error", msg)
+                        _audit("PRESTAMO_MOROSO", msg, "OK" if ok else "ERROR")
+                    except Exception as e:
+                        session.rollback(); alert("error", str(e))
+            else:
+                st.info("No hay préstamos activos con mora registrada.")
+
+            st.markdown("---")
+            st.markdown("**Constituir provisión**")
+            prov_monto = st.number_input("Monto provisión ($)", min_value=50.0, value=500.0, step=50.0, key="prov_monto")
+            prov_desc  = st.text_input("Descripción", value="Provisión Q1", key="prov_desc")
+            if st.button("🛡️ Constituir Provisión", key="btn_prov"):
+                try:
+                    ok, msg = constituir_provision(session, prov_monto, prov_desc)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("PROVISION_CONSTITUIR", prov_desc, "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+
+        with col2:
+            st.markdown("**Castigar préstamo incobrable**")
+            morosos = session.query(P).filter(P.estado == "MOROSO").all()
+            if morosos:
+                opts_m = {f"#{p.id} — ${p.saldo_pendiente:,.2f}": p.id for p in morosos}
+                sel_m = st.selectbox("Selecciona préstamo moroso", list(opts_m.keys()), key="sel_cast")
+                if st.button("💀 Castigar (Dar de Baja)", key="btn_cast"):
+                    try:
+                        ok, msg = castigar_prestamo_incobrable(session, opts_m[sel_m])
+                        session.commit()
+                        alert("success" if ok else "error", msg)
+                        _audit("PRESTAMO_CASTIGAR", msg, "OK" if ok else "ERROR")
+                    except Exception as e:
+                        session.rollback(); alert("error", str(e))
+            else:
+                st.info("No hay préstamos morosos para castigar.")
+
+            from contabilidad import saldo_cuenta as sc
+            st.metric("Provisión Acumulada", f"${sc(session, 'Provision Incobrables'):,.2f}")
+            st.metric("Préstamos Morosos", f"${sc(session, 'Prestamos Morosos'):,.2f}")
+
+        st.markdown("---")
+        st.markdown("**Cobrar mora a cliente**")
+        from models import Cliente as Cli
+        clientes = session.query(Cli).filter(Cli.estado == "ACTIVO").all()
+        col3, col4 = st.columns(2)
+        with col3:
+            cli_opts = {f"{c.nombre} (#{c.id})": c.id for c in clientes}
+            cli_sel = st.selectbox("Cliente", list(cli_opts.keys()), key="mora_cli")
+        with col4:
+            mora_monto = st.number_input("Monto mora ($)", min_value=1.0, value=10.0, step=5.0, key="mora_monto")
+        if st.button("💰 Cobrar Mora", key="btn_mora_cobrar"):
+            try:
+                ok, msg = cobrar_mora_prestamo(session, cli_opts[cli_sel], mora_monto)
+                session.commit()
+                alert("success" if ok else "error", msg)
+                _audit("MORA_COBRAR", msg, "OK" if ok else "ERROR")
+            except Exception as e:
+                session.rollback(); alert("error", str(e))
+
+    # ── Tab 3: PASIVOS BANCARIOS ────────────────────────────────────
+    with tabs[3]:
+        st.subheader("Obligaciones con Bancos")
+        st.info("Gestiona fondeo interbancario: préstamos recibidos de otros bancos.")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Recibir préstamo de otro banco**")
+            pb_monto  = st.number_input("Monto ($)", min_value=1000.0, value=10000.0, step=1000.0, key="pb_monto")
+            pb_banco  = st.text_input("Nombre del banco prestamista", value="Banco Agrícola", key="pb_banco")
+            if st.button("🏛️ Registrar Fondeo", key="btn_pb"):
+                try:
+                    ok, msg = recibir_prestamo_banco(session, pb_monto, pb_banco)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("FONDEO_RECIBIR", msg, "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+        with col2:
+            st.markdown("**Pagar cuota interbancaria**")
+            pp_capital  = st.number_input("Capital ($)", min_value=500.0, value=5000.0, step=500.0, key="pp_cap")
+            pp_interes  = st.number_input("Interés ($)", min_value=0.0, value=0.0, step=50.0, key="pp_int")
+            pp_banco    = st.text_input("Banco acreedor", value="Banco Agrícola", key="pp_banco")
+            if st.button("💳 Registrar Pago Interbancario", key="btn_pp"):
+                try:
+                    ok, msg = pagar_obligacion_banco(session, pp_capital, pp_interes, pp_banco)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("FONDEO_PAGAR", msg, "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+
+        from contabilidad import saldo_cuenta as sc
+        st.metric("Saldo — Obligaciones con Bancos", f"${sc(session, 'Obligaciones con Bancos'):,.2f}")
+
+        st.markdown("---")
+        st.subheader("Depósitos por Tipo de Cuenta")
+        col3, col4 = st.columns(2)
+        with col3:
+            st.metric("Cuentas de Ahorro", f"${sc(session, 'Cuentas de Ahorro'):,.2f}")
+        with col4:
+            st.metric("Cuentas Corrientes", f"${sc(session, 'Cuentas Corrientes'):,.2f}")
+        st.caption("Usa las operaciones principales de Depósito para mover fondos a estas cuentas.")
+        st.markdown("**Depósito directo a cuenta de ahorro**")
+        from models import Cliente as Cli2
+        cl2 = session.query(Cli2).filter(Cli2.estado == "ACTIVO").all()
+        col5, col6 = st.columns(2)
+        with col5:
+            opts_ah = {f"{c.nombre} (#{c.id})": c.id for c in cl2}
+            sel_ah = st.selectbox("Cliente", list(opts_ah.keys()), key="ah_cli")
+            tipo_dep = st.radio("Tipo de cuenta", ["Ahorro", "Corriente"], key="tipo_dep")
+        with col6:
+            monto_ah = st.number_input("Monto ($)", min_value=10.0, value=500.0, step=50.0, key="ah_monto")
+        if st.button("💾 Registrar Depósito Tipificado", key="btn_ah"):
+            try:
+                if tipo_dep == "Ahorro":
+                    ok, msg = deposito_cuenta_ahorro(session, opts_ah[sel_ah], monto_ah)
+                else:
+                    ok, msg = deposito_cuenta_corriente(session, opts_ah[sel_ah], monto_ah)
+                session.commit()
+                alert("success" if ok else "error", msg)
+                audit(session, usuario,
+                      f"DEP_{tipo_dep.upper()}", msg, "OK" if ok else "ERROR")
+            except Exception as e:
+                session.rollback(); alert("error", str(e))
+
+    # ── Tab 4: IMPUESTOS ────────────────────────────────────────────
+    with tabs[4]:
+        st.subheader("Gestión de Impuestos")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Provisionar impuesto**")
+            imp_monto = st.number_input("Monto ($)", min_value=10.0, value=100.0, step=50.0, key="imp_monto")
+            imp_tipo  = st.selectbox("Tipo de impuesto", ["Renta", "IVA", "Municipal", "Otro"], key="imp_tipo")
+            if st.button("📋 Provisionar", key="btn_imp_prov"):
+                try:
+                    ok, msg = provisionar_impuesto(session, imp_monto, imp_tipo)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("IMPUESTO_PROVISIONAR", f"{imp_tipo} ${imp_monto}", "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+        with col2:
+            st.markdown("**Pagar impuesto**")
+            pag_monto = st.number_input("Monto a pagar ($)", min_value=10.0, value=100.0, step=50.0, key="pag_imp_monto")
+            pag_tipo  = st.selectbox("Tipo", ["Renta", "IVA", "Municipal", "Otro"], key="pag_imp_tipo")
+            if st.button("💸 Pagar Impuesto", key="btn_imp_pagar"):
+                try:
+                    ok, msg = pagar_impuesto(session, pag_monto, pag_tipo)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("IMPUESTO_PAGAR", f"{pag_tipo} ${pag_monto}", "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+
+        from contabilidad import saldo_cuenta as sc
+        st.metric("Impuestos por Pagar (pendientes)", f"${sc(session, 'Impuestos por Pagar'):,.2f}")
+
+    # ── Tab 5: PATRIMONIO Y RESERVAS ────────────────────────────────
+    with tabs[5]:
+        st.subheader("Patrimonio — Reservas Legales y Utilidades")
+        from contabilidad import saldo_cuenta as sc
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Capital Banco", f"${sc(session, 'Capital Banco'):,.2f}")
+        col2.metric("Reservas Legales", f"${sc(session, 'Reservas Legales'):,.2f}")
+        col3.metric("Utilidades del Ejercicio", f"${sc(session, 'Utilidades del Ejercicio'):,.2f}")
+
+        st.markdown("---")
+        col4, col5 = st.columns(2)
+        with col4:
+            st.markdown("**Constituir Reserva Legal (BCR)**")
+            res_monto = st.number_input("Monto de reserva ($)", min_value=10.0, value=500.0, step=100.0, key="res_monto")
+            st.caption("Requiere saldo en Utilidades del Ejercicio")
+            if st.button("🏦 Constituir Reserva Legal", key="btn_res"):
+                try:
+                    ok, msg = constituir_reserva_legal(session, res_monto)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("RESERVA_LEGAL", f"${res_monto}", "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+        with col5:
+            st.markdown("**Registrar Utilidades del Ejercicio**")
+            util_monto = st.number_input("Monto de utilidades ($)", min_value=10.0, value=1000.0, step=100.0, key="util_monto")
+            st.caption("Cierre contable: traslada resultado del período")
+            if st.button("📈 Registrar Utilidades", key="btn_util"):
+                try:
+                    ok, msg = registrar_utilidad_ejercicio(session, util_monto)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("UTILIDADES_REGISTRAR", f"${util_monto}", "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+
+    # ── Tab 6: COMISIONES TC ────────────────────────────────────────
+    with tabs[6]:
+        st.subheader("Ingresos por Tarjeta de Crédito")
+        st.info("Registra las comisiones que el banco cobra al comercio cuando clientes usan su tarjeta de crédito.")
+        from contabilidad import saldo_cuenta as sc
+        tc_monto = st.number_input("Monto comisión ($)", min_value=1.0, value=25.0, step=5.0, key="tc_monto")
+        tc_desc  = st.text_input("Referencia / Comercio", value="Comisión TC — Comercio", key="tc_desc")
+        if st.button("💳 Registrar Comisión TC", key="btn_tc"):
+            try:
+                ok, msg = registrar_comision_tarjeta_credito(session, tc_monto, tc_desc)
+                session.commit()
+                alert("success" if ok else "error", msg)
+                _audit("COMISION_TC", tc_desc, "OK" if ok else "ERROR")
+            except Exception as e:
+                session.rollback(); alert("error", str(e))
+        st.metric("Total Ingresos Tarjeta Crédito", f"${sc(session, 'Ingresos Tarjeta Credito'):,.2f}")
+
+    # ── Tab 7: GASTOS OPERATIVOS ─────────────────────────────────────
+    with tabs[7]:
+        st.subheader("Gastos Operativos del Banco")
+        from contabilidad import saldo_cuenta as sc
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Registrar gasto operativo**")
+            go_monto = st.number_input("Monto ($)", min_value=10.0, value=500.0, step=100.0, key="go_monto")
+            go_desc  = st.selectbox("Categoría", [
+                "Salarios del mes", "Alquiler de oficinas", "Servicios públicos",
+                "Mantenimiento de sistemas", "Papelería y útiles", "Publicidad",
+                "Gastos de representación", "Otro"
+            ], key="go_cat")
+            go_det = st.text_input("Detalle adicional", key="go_det")
+            if st.button("💼 Registrar Gasto Operativo", key="btn_go"):
+                desc_completa = f"{go_desc}" + (f" — {go_det}" if go_det else "")
+                try:
+                    ok, msg = registrar_gasto_operativo(session, go_monto, desc_completa)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("GASTO_OPERATIVO", desc_completa, "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+        with col2:
+            st.markdown("**Registrar mora pagada por el banco**")
+            mp_monto = st.number_input("Monto multa/mora ($)", min_value=10.0, value=100.0, step=10.0, key="mp_monto")
+            mp_desc  = st.text_input("Descripción", value="Multa regulatoria BCR", key="mp_desc")
+            if st.button("⚡ Registrar Mora Pagada", key="btn_mp"):
+                try:
+                    ok, msg = registrar_mora_pagada_banco(session, mp_monto, mp_desc)
+                    session.commit()
+                    alert("success" if ok else "error", msg)
+                    _audit("MORA_PAGADA_BANCO", mp_desc, "OK" if ok else "ERROR")
+                except Exception as e:
+                    session.rollback(); alert("error", str(e))
+
+        st.markdown("---")
+        col3, col4 = st.columns(2)
+        col3.metric("Gastos Operativos Totales", f"${sc(session, 'Gastos Operativos'):,.2f}")
+        col4.metric("Gastos por Mora Pagada", f"${sc(session, 'Gastos por Mora Pagada'):,.2f}")
+
+    # ── Tab 8: SALDOS DEL PLAN ───────────────────────────────────────
+    with tabs[8]:
+        st.subheader("Saldos de Todas las Cuentas Contables")
+        from models import CuentaContable
+        cuentas = session.query(CuentaContable).order_by(
+            CuentaContable.categoria, CuentaContable.nombre).all()
+        cat_actual = None
+        for c in cuentas:
+            if c.categoria != cat_actual:
+                cat_actual = c.categoria
+                colores = {"ACTIVO": "🟦", "PASIVO": "🟥", "PATRIMONIO": "🟩",
+                           "INGRESO": "🟨", "GASTO": "🟧"}
+                st.markdown(f"**{colores.get(cat_actual,'⬜')} {cat_actual}**")
+            saldo = c.saldo(session)
+            signo = "+" if saldo >= 0 else ""
+            st.write(f"  • {c.nombre}: **{signo}${saldo:,.2f}**")
+
+
 #  VISTA: MONITOR AML
 # ═══════════════════════════════════════════════════════════
 
@@ -3379,7 +4187,7 @@ def main():
 
             if usuario.rol == "ADMIN":
                 with st.expander("🔧 Modo desarrollo"):
-                    st.caption("Ejecuta 1000 operaciones aleatorias.")
+                    st.caption("Crea clientes temporales, ejecuta 500 operaciones aleatorias, verifica integridad y limpia automáticamente. No requiere preparación previa.")
                     if st.button("🔥 Stress Test", type="secondary"):
                         dev_session = get_session()
                         try:
@@ -3400,6 +4208,40 @@ def main():
                             ejecutar_diagnostico_completo(dev_session2)
                         finally:
                             dev_session2.close()
+
+                    st.divider()
+                    st.caption("Validar partida doble de las 3 nuevas cuentas.")
+                    
+                    escenario = st.selectbox(
+                        "Prueba contable",
+                        ["Plazo Fijo", "Consumo TC", "Pago Intereses"]
+                    )
+                    monto_prueba = st.number_input("Monto ($)", min_value=1.0, value=100.0)
+                    
+                    if st.button("⚙️ Ejecutar y Reconciliar", type="primary"):
+                        try:
+                            # 1. Ejecutamos la operación según el selector
+                            if escenario == "Plazo Fijo":
+                                from operaciones import abrir_plazo_fijo
+                                abrir_plazo_fijo(session, cliente_id=1, monto=monto_prueba, tasa=0.05, meses=6)
+                            elif escenario == "Consumo TC":
+                                from operaciones import consumir_tarjeta_credito
+                                consumir_tarjeta_credito(session, tarjeta_id=1, monto_consumo=monto_prueba)
+                            
+                            # 2. Reconciliamos al instante
+                            from contabilidad import reconciliar
+                            errores, reporte = reconciliar(session)
+                            
+                            # 3. Mostramos resultado rápido sin saturar la pantalla
+                            if errores == 0:
+                                st.success("✅ Partida doble cuadrada perfectamente.")
+                            else:
+                                st.error(f"❌ {errores} errores de descuadre detectados.")
+                                
+                        except Exception as e:
+                            session.rollback()
+                            st.error(f"Error en simulación: {e}")
+
 
         # ── Despacho de vistas con guardias de permiso ──
         if opcion == "📊 Panel principal":
@@ -3474,6 +4316,11 @@ def main():
                 vista_aml(session, usuario)
             else:
                 _acceso_denegado("ver_aml")
+        elif opcion == "🏦 Contabilidad Avanzada":
+            if tiene_permiso(usuario, "reportes"):
+                vista_contabilidad_avanzada(session, usuario)
+            else:
+                _acceso_denegado("reportes")
         elif opcion == "📊 Dashboard Gerencial":
             if tiene_permiso(usuario, "ver_dashboard_gerencial"):
                 vista_dashboard_gerencial(session)

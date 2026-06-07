@@ -2,17 +2,23 @@
 contabilidad.py — Motor de contabilidad de partida doble
 Sin dependencias externas: solo SQLAlchemy.
 
-PLAN DE CUENTAS:
-  ACTIVOS      (tipo_normal=D): Caja General, Prestamos x Cobrar, Intereses x Cobrar
-  PASIVOS      (tipo_normal=C): Depositos Clientes
-  PATRIMONIO   (tipo_normal=C): Capital Banco
-  INGRESOS     (tipo_normal=C): Ingresos Intereses, Ingresos Comisiones
+PLAN DE CUENTAS COMPLETO:
+  ACTIVOS      (tipo_normal=D): Caja General, Prestamos x Cobrar, Intereses x Cobrar,
+                                 Inversiones, Bienes e Inmuebles, Deudores por Tarjeta,
+                                 Prestamos Morosos
+                                 Provision Incobrables (contra-activo, tipo_normal=C)
+  PASIVOS      (tipo_normal=C): Cuentas de Ahorro, Cuentas Corrientes,
+                                 Depositos Clientes (retrocompat), Depositos a Plazo Fijo,
+                                 Obligaciones con Bancos, Impuestos por Pagar
+  PATRIMONIO   (tipo_normal=C): Capital Banco, Reservas Legales, Utilidades del Ejercicio
+  INGRESOS     (tipo_normal=C): Ingresos Intereses, Ingresos Comisiones,
+                                 Ingresos Tarjeta Credito, Ingresos por Mora
+  GASTOS       (tipo_normal=D): Gastos Intereses, Gastos Operativos,
+                                 Gastos por Provisiones, Gastos por Mora Pagada
 """
 
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
-from sqlalchemy import func
-
 from models import CuentaContable, Asiento, LineaAsiento, ConfigBanco
 
 
@@ -28,14 +34,45 @@ def f(v):
 # ─── Plan de cuentas ─────────────────────────────────────────
 
 PLAN_CUENTAS = [
-    # (nombre,                categoria,    tipo_normal)
-    ("Caja General",          "ACTIVO",     "D"),
-    ("Prestamos x Cobrar",    "ACTIVO",     "D"),
-    ("Intereses x Cobrar",    "ACTIVO",     "D"),
-    ("Depositos Clientes",    "PASIVO",     "C"),
-    ("Capital Banco",         "PATRIMONIO", "C"),
-    ("Ingresos Intereses",    "INGRESO",    "C"),
-    ("Ingresos Comisiones",   "INGRESO",    "C"),
+    # ── ACTIVOS ─────────────────────────────────────────────
+    ("Caja General",               "ACTIVO",     "D"),
+    ("Prestamos x Cobrar",         "ACTIVO",     "D"),
+    ("Intereses x Cobrar",         "ACTIVO",     "D"),
+    ("Deudores por Tarjeta",       "ACTIVO",     "D"),
+    # Nuevas cuentas de activo
+    ("Inversiones",                "ACTIVO",     "D"),  # valores, bonos, inversiones
+    ("Bienes e Inmuebles",         "ACTIVO",     "D"),  # edificios, equipos, mobiliario
+    ("Prestamos Morosos",          "ACTIVO",     "D"),  # préstamos en mora separados
+    ("Provision Incobrables",      "ACTIVO",     "C"),  # contra-activo (reduce activos)
+
+    # ── PASIVOS ─────────────────────────────────────────────
+    ("Depositos Clientes",         "PASIVO",     "C"),  # retrocompatibilidad
+    ("Depositos a Plazo Fijo",     "PASIVO",     "C"),
+    # Nuevas cuentas de pasivo
+    ("Cuentas de Ahorro",          "PASIVO",     "C"),  # depósitos de ahorro
+    ("Cuentas Corrientes",         "PASIVO",     "C"),  # cuentas corrientes
+    ("Obligaciones con Bancos",    "PASIVO",     "C"),  # préstamos de otros bancos
+    ("Impuestos por Pagar",        "PASIVO",     "C"),  # IVA, renta
+
+    # ── PATRIMONIO ──────────────────────────────────────────
+    ("Capital Banco",              "PATRIMONIO", "C"),
+    # Nuevas cuentas de patrimonio
+    ("Reservas Legales",           "PATRIMONIO", "C"),  # reserva legal BCR El Salvador
+    ("Utilidades del Ejercicio",   "PATRIMONIO", "C"),  # ganancias del período
+
+    # ── INGRESOS ────────────────────────────────────────────
+    ("Ingresos Intereses",         "INGRESO",    "C"),
+    ("Ingresos Comisiones",        "INGRESO",    "C"),
+    # Nuevos ingresos
+    ("Ingresos Tarjeta Credito",   "INGRESO",    "C"),  # comisiones al comercio por TC
+    ("Ingresos por Mora",          "INGRESO",    "C"),  # intereses de penalización
+
+    # ── GASTOS ──────────────────────────────────────────────
+    ("Gastos Intereses",           "GASTO",      "D"),
+    # Nuevos gastos
+    ("Gastos Operativos",          "GASTO",      "D"),  # salarios, alquiler, servicios
+    ("Gastos por Provisiones",     "GASTO",      "D"),  # cuando un préstamo se vuelve incobrable
+    ("Gastos por Mora Pagada",     "GASTO",      "D"),  # multas que paga el banco
 ]
 
 CAPITAL_INICIAL = Decimal("10000.0")
@@ -139,52 +176,105 @@ def reconciliar(session):
     from models import Cliente, Prestamo
     from sqlalchemy import func
 
-    caja        = saldo_cuenta(session, "Caja General")
-    prest_c     = saldo_cuenta(session, "Prestamos x Cobrar")
-    int_c       = saldo_cuenta(session, "Intereses x Cobrar")
-    depositos   = saldo_cuenta(session, "Depositos Clientes")
-    capital     = saldo_cuenta(session, "Capital Banco")
-    ing_int     = saldo_cuenta(session, "Ingresos Intereses")
-    ing_com     = saldo_cuenta(session, "Ingresos Comisiones")
+    # ── ACTIVOS ──────────────────────────────────────────────
+    caja          = saldo_cuenta(session, "Caja General")
+    prest_c       = saldo_cuenta(session, "Prestamos x Cobrar")
+    int_c         = saldo_cuenta(session, "Intereses x Cobrar")
+    tarjetas_c    = saldo_cuenta(session, "Deudores por Tarjeta")
+    inversiones   = saldo_cuenta(session, "Inversiones")
+    inmuebles     = saldo_cuenta(session, "Bienes e Inmuebles")
+    morosos       = saldo_cuenta(session, "Prestamos Morosos")
+    provision     = saldo_cuenta(session, "Provision Incobrables")   # contra-activo (ya negativo)
 
-    activos     = round(caja + prest_c + int_c, 2)
-    pasivos     = round(depositos, 2)
-    patrimonio  = round(capital + ing_int + ing_com, 2)
-    diff_bal    = round(activos - pasivos - patrimonio, 2)
+    # ── PASIVOS ──────────────────────────────────────────────
+    dep_clientes  = saldo_cuenta(session, "Depositos Clientes")
+    plazos_fijos  = saldo_cuenta(session, "Depositos a Plazo Fijo")
+    ahorros       = saldo_cuenta(session, "Cuentas de Ahorro")
+    corrientes    = saldo_cuenta(session, "Cuentas Corrientes")
+    oblig_bancos  = saldo_cuenta(session, "Obligaciones con Bancos")
+    impuestos_pp  = saldo_cuenta(session, "Impuestos por Pagar")
+
+    # ── PATRIMONIO ───────────────────────────────────────────
+    capital       = saldo_cuenta(session, "Capital Banco")
+    reservas      = saldo_cuenta(session, "Reservas Legales")
+    utilidades    = saldo_cuenta(session, "Utilidades del Ejercicio")
+
+    # ── INGRESOS ─────────────────────────────────────────────
+    ing_int       = saldo_cuenta(session, "Ingresos Intereses")
+    ing_com       = saldo_cuenta(session, "Ingresos Comisiones")
+    ing_tc        = saldo_cuenta(session, "Ingresos Tarjeta Credito")
+    ing_mora      = saldo_cuenta(session, "Ingresos por Mora")
+
+    # ── GASTOS ───────────────────────────────────────────────
+    gast_int      = saldo_cuenta(session, "Gastos Intereses")
+    gast_oper     = saldo_cuenta(session, "Gastos Operativos")
+    gast_prov     = saldo_cuenta(session, "Gastos por Provisiones")
+    gast_mora     = saldo_cuenta(session, "Gastos por Mora Pagada")
+
+    # Provision Incobrables es contra-activo: su saldo reduce el total de activos
+    activos    = round(caja + prest_c + int_c + tarjetas_c + inversiones + inmuebles + morosos - provision, 2)
+    pasivos    = round(dep_clientes + plazos_fijos + ahorros + corrientes + oblig_bancos + impuestos_pp, 2)
+    ing_total  = ing_int + ing_com + ing_tc + ing_mora
+    gast_total = gast_int + gast_oper + gast_prov + gast_mora
+    patrimonio = round(capital + reservas + utilidades + ing_total - gast_total, 2)
+    diff_bal   = round(activos - pasivos - patrimonio, 2)
 
     # Débitos vs créditos globales
     total_deb = session.query(func.coalesce(func.sum(LineaAsiento.debito),  0.0)).scalar()
     total_cre = session.query(func.coalesce(func.sum(LineaAsiento.credito), 0.0)).scalar()
     diff_libro = round(float(total_deb) - float(total_cre), 2)
 
-    # Depósitos: la cuenta Depositos Clientes debe ser EXACTAMENTE igual a la suma
-    # de saldos de clientes. Esto es así porque cada operación que cambia el saldo
-    # del cliente (depósito, retiro, transferencia, préstamo, pago) tiene su
-    # contrapartida exacta en la cuenta Depositos Clientes.
     suma_clientes = float(
         session.query(func.coalesce(func.sum(Cliente.saldo), 0.0)).scalar()
     )
-    diff_dep = round(suma_clientes - depositos, 2)
+
+    dep_total = dep_clientes + ahorros + corrientes
+
+    diff_dep = round(suma_clientes - dep_total, 2)
 
     errores = 0
     lines   = []
 
     lines += [
         "═══════════════ BALANCE GENERAL ═══════════════",
-        f"  Caja General:          ${caja:>12,.2f}",
-        f"  Préstamos x Cobrar:    ${prest_c:>12,.2f}",
-        f"  Intereses x Cobrar:    ${int_c:>12,.2f}",
-        f"  ─────────────────────────────────────────",
-        f"  TOTAL ACTIVOS:         ${activos:>12,.2f}",
+        "── ACTIVOS ─────────────────────────────────────",
+        f"  Caja General:              ${caja:>12,.2f}",
+        f"  Prestamos x Cobrar:        ${prest_c:>12,.2f}",
+        f"  Intereses x Cobrar:        ${int_c:>12,.2f}",
+        f"  Deudores por Tarjeta:      ${tarjetas_c:>12,.2f}",
+        f"  Inversiones:               ${inversiones:>12,.2f}",
+        f"  Bienes e Inmuebles:        ${inmuebles:>12,.2f}",
+        f"  Préstamos Morosos:         ${morosos:>12,.2f}",
+        f"  (-) Provisión Incobrables: ${-provision:>12,.2f}",
+        f"  ─────────────────────────────────────────────",
+        f"  TOTAL ACTIVOS:             ${activos:>12,.2f}",
         "",
-        f"  Depósitos Clientes:    ${depositos:>12,.2f}",
-        f"  Capital Banco:         ${capital:>12,.2f}",
-        f"  Ingresos Intereses:    ${ing_int:>12,.2f}",
-        f"  Ingresos Comisiones:   ${ing_com:>12,.2f}",
-        f"  ─────────────────────────────────────────",
-        f"  TOTAL PAS+PAT+ING:     ${(pasivos+patrimonio):>12,.2f}",
-        f"  DIFERENCIA:            ${diff_bal:>12,.2f}",
-        ("  ✅ BALANCE CUADRADO" if abs(diff_bal) < 0.01
+        "── PASIVOS ─────────────────────────────────────",
+        f"  Depósitos Clientes:        ${dep_clientes:>12,.2f}",
+        f"  Cuentas de Ahorro:         ${ahorros:>12,.2f}",
+        f"  Cuentas Corrientes:        ${corrientes:>12,.2f}",
+        f"  Depósitos a Plazo Fijo:    ${plazos_fijos:>12,.2f}",
+        f"  Obligaciones con Bancos:   ${oblig_bancos:>12,.2f}",
+        f"  Impuestos por Pagar:       ${impuestos_pp:>12,.2f}",
+        f"  ─────────────────────────────────────────────",
+        f"  TOTAL PASIVOS:             ${pasivos:>12,.2f}",
+        "",
+        "── PATRIMONIO + RESULTADOS ──────────────────────",
+        f"  Capital Banco:             ${capital:>12,.2f}",
+        f"  Reservas Legales:          ${reservas:>12,.2f}",
+        f"  Utilidades del Ejercicio:  ${utilidades:>12,.2f}",
+        f"  Ingresos Intereses:        ${ing_int:>12,.2f}",
+        f"  Ingresos Comisiones:       ${ing_com:>12,.2f}",
+        f"  Ingresos Tarjeta Crédito:  ${ing_tc:>12,.2f}",
+        f"  Ingresos por Mora:         ${ing_mora:>12,.2f}",
+        f"  (-) Gastos Intereses:      ${-gast_int:>12,.2f}",
+        f"  (-) Gastos Operativos:     ${-gast_oper:>12,.2f}",
+        f"  (-) Gastos por Provisiones:${-gast_prov:>12,.2f}",
+        f"  (-) Gastos por Mora Pagada:${-gast_mora:>12,.2f}",
+        f"  ─────────────────────────────────────────────",
+        f"  TOTAL PAT+RES:             ${patrimonio:>12,.2f}",
+        f"  DIFERENCIA:                ${diff_bal:>12,.2f}",
+        ("✅ BALANCE CUADRADO" if abs(diff_bal) < 0.01
          else f"  ❌ Balance descuadrado en ${diff_bal:,.2f}"),
         "",
         "═══════════════ LIBRO MAYOR ════════════════════",
@@ -195,9 +285,9 @@ def reconciliar(session):
          else f"  ❌ Libro descuadrado en ${diff_libro:,.2f}"),
         "",
         "═══════════════ DEPÓSITOS ══════════════════════",
-        f"  Suma saldos clientes:  ${suma_clientes:>12,.2f}",
-        f"  Cuenta Dep. Clientes:  ${depositos:>12,.2f}",
-        f"  Diferencia:            ${diff_dep:>12,.2f}",
+        f"  Suma saldos clientes:      ${suma_clientes:>12,.2f}",
+        f"  Dep. Clientes+Ahorro+Cte:  ${dep_total:>12,.2f}",
+        f"  Diferencia:                ${diff_dep:>12,.2f}",
         ("  ✅ DEPÓSITOS CUADRAN" if abs(diff_dep) < 0.01
          else f"  ❌ Diferencia en depósitos ${diff_dep:,.2f}"),
         "",

@@ -8,7 +8,6 @@ Refinanciamiento, Balance General, Estado de Resultados.
 from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import random, string
-
 from sqlalchemy import func, text
 from contabilidad import money, registrar, saldo_cuenta
 from models import (
@@ -553,7 +552,11 @@ def generar_balance_general(session):
         saldo = c.saldo(session)
 
         if c.categoria == "ACTIVO":
-            activos.append((c.nombre, saldo))
+
+            if c.nombre == "Provision Incobrables":
+                activos.append((c.nombre, -saldo))
+            else:
+                 activos.append((c.nombre, saldo))
 
         elif c.categoria == "PASIVO":
             pasivos.append((c.nombre, saldo))

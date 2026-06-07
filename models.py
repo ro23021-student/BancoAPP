@@ -77,7 +77,6 @@ class Cliente(BaseLocal):
     tipo             = Column(String, default="Ahorro")   # nombre del tipo
     tipo_cuenta_id   = Column(Integer, ForeignKey("tipos_cuenta.id"), nullable=True)
     estado           = Column(String, default="ACTIVO")   # ACTIVO | SUSPENDIDO | CERRADO
-
     # ── Datos personales ──
     documento        = Column(String)
     tipo_documento   = Column(String, default="DUI")
@@ -115,6 +114,8 @@ class Cliente(BaseLocal):
     tarjetas_credito = relationship("TarjetaCredito", back_populates="cliente", cascade="all, delete-orphan")
     depositos_plazo  = relationship("DepositoPlazoFijo", back_populates="cliente", cascade="all, delete-orphan")
     alertas_aml      = relationship("AlertaAML", back_populates="cliente", cascade="all, delete-orphan")
+    activo           = Column(Boolean, default=True)
+
 
 
 class Movimiento(BaseLocal):

@@ -36,6 +36,7 @@ PERMISOS = {
         "ver_dashboard_gerencial",
         "realizar_cierre_diario",
         "ver_balance_general",
+        "reportes",          # contabilidad avanzada
     },
     "GERENTE": {
         "ver_panel", "ver_clientes",
@@ -51,6 +52,7 @@ PERMISOS = {
         "ver_dashboard_gerencial",
         "realizar_cierre_diario",
         "ver_balance_general",
+        "reportes",          # contabilidad avanzada
     },
     "CAJERO": {
         "ver_panel", "ver_clientes", "crear_cliente", "editar_cliente",
@@ -65,6 +67,7 @@ PERMISOS = {
         "ver_clientes", "ver_auditlog",
         "ver_aml",
         "ver_balance_general",
+        "reportes",          # contabilidad avanzada (solo lectura)
     },
 }
 
@@ -72,18 +75,21 @@ MENU_POR_ROL = {
     "ADMIN":   ["📊 Panel principal", "👥 Clientes", "💵 Operaciones bancarias",
                 "🏷️ Préstamos", "💳 Tarjetas", "🏦 Sucursales & ATM",
                 "📑 Plazo Fijo", "🤝 Socios", "🚨 Monitor AML",
+                "🏦 Contabilidad Avanzada",
                 "📈 Reportes contables", "📊 Dashboard Gerencial",
                 "🔍 Reconciliación", "⚙️ Configuración", "🔔 Alertas",
                 "👤 Gestión de usuarios", "📋 Log de auditoría"],
     "GERENTE": ["📊 Panel principal", "👥 Clientes", "🏷️ Préstamos",
                 "💳 Tarjetas", "🏦 Sucursales & ATM", "📑 Plazo Fijo", "🤝 Socios",
-                "🚨 Monitor AML", "📈 Reportes contables",
+                "🚨 Monitor AML", "🏦 Contabilidad Avanzada",
+                "📈 Reportes contables",
                 "📊 Dashboard Gerencial", "🔍 Reconciliación",
                 "🔔 Alertas", "📋 Log de auditoría"],
     "CAJERO":  ["📊 Panel principal", "👥 Clientes", "💵 Operaciones bancarias",
                 "🏷️ Préstamos", "💳 Tarjetas", "📑 Plazo Fijo", "🤝 Socios"],
     "AUDITOR": ["📊 Panel principal", "👥 Clientes", "📈 Reportes contables",
-                "🚨 Monitor AML", "🔍 Reconciliación", "📋 Log de auditoría"],
+                "🚨 Monitor AML", "🏦 Contabilidad Avanzada",
+                "🔍 Reconciliación", "📋 Log de auditoría"],
 }
 
 ROL_COLOR = {

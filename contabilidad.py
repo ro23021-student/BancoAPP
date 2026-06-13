@@ -82,10 +82,14 @@ CAPITAL_INICIAL = Decimal("10000.0")
 
 def inicializar_contabilidad(session):
     """Crea el plan de cuentas y el capital inicial (solo una vez)."""
-    # Crear cuentas faltantes
+    # Crear cuentas faltantes — con manejo de duplicados por condición de carrera
     for nombre, cat, tn in PLAN_CUENTAS:
         if not session.query(CuentaContable).filter_by(nombre=nombre).first():
-            session.add(CuentaContable(nombre=nombre, categoria=cat, tipo_normal=tn))
+            try:
+                session.add(CuentaContable(nombre=nombre, categoria=cat, tipo_normal=tn))
+                session.flush()
+            except Exception:
+                session.rollback()
     session.flush()
 
     # Capital inicial — solo una vez

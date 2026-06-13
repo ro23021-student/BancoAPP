@@ -83,10 +83,9 @@ from operaciones import tasa_deposito, tasa_transferencia, tasa_prestamo
 # ─────────────────────────────
 @st.cache_resource
 def get_engine():
-    engine = create_engine(
-        "sqlite:///banco.db",
-        connect_args={"check_same_thread": False},
-    )
+    db_url = st.secrets.get("DATABASE_URL", "sqlite:///banco.db")
+    connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
+    engine = create_engine(db_url, connect_args=connect_args)
     BaseLocal.metadata.create_all(engine)
     return engine
 

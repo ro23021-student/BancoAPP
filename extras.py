@@ -5,9 +5,10 @@ Tarjetas, Sucursales, ATM, AML, KYC, Cierre Diario, Socios/Aportes,
 Refinanciamiento, Balance General, Estado de Resultados.
 """
 
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
 import random, string
+from tiempo import hoy as _hoy
 from sqlalchemy import func, text
 from contabilidad import money, registrar, saldo_cuenta
 from models import (
@@ -143,6 +144,7 @@ def eliminar_beneficiario(session, beneficiario_id, cliente_id):
 # ─────────────────────────────────────────────────────────────
 
 def crear_deposito_plazo(session, cliente_id, monto, tasa_anual, plazo_meses, renovacion=False):
+    
     cliente = session.query(Cliente).filter_by(id=cliente_id).first()
     if not cliente:
         return False, "Cliente no encontrado"
@@ -157,8 +159,9 @@ def crear_deposito_plazo(session, cliente_id, monto, tasa_anual, plazo_meses, re
 
     tasa = Decimal(str(tasa_anual))
     interes = money(monto * tasa * Decimal(plazo_meses) / Decimal("12"))
+    from tiempo import hoy as _hoy
     monto_total = money(monto + interes)
-    hoy = date.today()
+    hoy = _hoy()
     fecha_venc = date(hoy.year + (hoy.month + plazo_meses - 1) // 12,
                       (hoy.month + plazo_meses - 1) % 12 + 1, hoy.day)
 
@@ -270,7 +273,7 @@ def refinanciar_prestamo(session, prestamo_id, nuevo_plazo_meses, tasa_anual=Non
     total = money(saldo + interes_total)
     cuota = money(total / nuevo_plazo_meses)
 
-    hoy = date.today()
+    hoy = _hoy()
     fecha_venc = date(hoy.year + (hoy.month + nuevo_plazo_meses - 1) // 12,
                       (hoy.month + nuevo_plazo_meses - 1) % 12 + 1, hoy.day)
 
@@ -389,7 +392,6 @@ def emitir_tarjeta_debito(session, cliente_id):
     cliente = session.query(Cliente).filter_by(id=cliente_id).first()
     if not cliente:
         return False, "Cliente no encontrado"
-    from datetime import date
     venc = f"{(date.today().month):02d}/{str(date.today().year + 4)[2:]}"
     td = TarjetaDebito(cliente_id=cliente_id, vencimiento=venc)
     session.add(td)
@@ -403,7 +405,6 @@ def emitir_tarjeta_credito(session, cliente_id, limite):
         return False, "Cliente no encontrado"
     if cliente.score_credito and cliente.score_credito < 500:
         return False, f"Score crediticio insuficiente ({cliente.score_credito}). Mínimo requerido: 500"
-    from datetime import date
     venc = f"{(date.today().month):02d}/{str(date.today().year + 3)[2:]}"
     tc = TarjetaCredito(
         cliente_id=cliente_id,
@@ -425,7 +426,7 @@ UMBRAL_AML_TRANSFERENCIAS_DIA = 5
 def verificar_aml(session, cliente_id, monto, tipo_operacion=""):
     alertas_generadas = []
     monto = money(monto)
-    hoy = datetime.utcnow().date()
+    hoy = _hoy()
 
     # Regla 1: monto alto
     if monto >= UMBRAL_AML_MONTO:
@@ -485,7 +486,7 @@ def revisar_alerta_aml(session, alerta_id, revisor, notas="", cerrar=False):
 # ─────────────────────────────────────────────────────────────
 
 def realizar_cierre_diario(session, usuario_nombre, notas=""):
-    hoy = datetime.utcnow().date()
+    hoy = _hoy()
     if session.query(CierreDiario).filter_by(fecha=hoy).first():
         return False, "Ya se realizó el cierre de hoy"
 
@@ -708,7 +709,7 @@ def historial_cliente(session, cliente_id):
 # ─────────────────────────────────────────────────────────────
 
 def actualizar_cuotas_vencidas(session):
-    hoy = date.today()
+    hoy = _hoy()
     cuotas = (session.query(CuotaPrestamo)
               .filter(CuotaPrestamo.estado == "PENDIENTE")
               .filter(CuotaPrestamo.fecha_vencimiento < hoy)

@@ -2,4 +2,5 @@ env/
 __pycache__/
 *.pyc
 tests/
-.secrets.toml
+.streamlit/
+banco.db

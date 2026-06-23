@@ -6,6 +6,7 @@ como el libro mayor contable, garantizando consistencia.
 
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+from tiempo import hoy as _hoy
 import re
 MIN_TRANSACCION = Decimal("1.00")
 from sqlalchemy import func
@@ -228,7 +229,7 @@ def abrir_plazo_fijo(session, cliente_id, monto, tasa, meses):
     tasa_dec          = Decimal(str(tasa))
     interes_proyectado = money(monto_dec * tasa_dec * Decimal(meses) / Decimal("12"))
     monto_total        = money(monto_dec + interes_proyectado)
-    hoy                = _date.today()
+    hoy                = _hoy()
     fecha_venc         = _date(
         hoy.year + (hoy.month + meses - 1) // 12,
         (hoy.month + meses - 1) % 12 + 1,
@@ -1095,7 +1096,7 @@ def procesar_apertura_plazo_fijo(session, cliente_id: int, monto: float, tasa: f
     tasa_dec           = Decimal(str(tasa))
     interes_proyectado = money(monto_dec * tasa_dec * Decimal(meses) / Decimal("12"))
     monto_total        = money(monto_dec + interes_proyectado)
-    hoy                = _date.today()
+    hoy                = _hoy()
     fecha_venc         = _date(
         hoy.year + (hoy.month + meses - 1) // 12,
         (hoy.month + meses - 1) % 12 + 1,
@@ -1509,6 +1510,19 @@ def cobrar_mora_prestamo(session, cliente_id: int, monto: float):
               creditos=[("Ingresos por Mora", monto_dec)],
               descripcion=f"Cobro mora cliente #{cliente_id}")
     _mov(session, cliente_id, "Mora Cobrada", monto_dec, f"Intereses de mora ${monto_dec:,.2f}")
+
+    # Reducir mora_acumulada del préstamo activo con mora de este cliente,
+    # para que la pantalla de Mora y Provisiones refleje el cobro.
+    prestamo_con_mora = (session.query(Prestamo)
+                          .filter_by(cliente_id=cliente_id, estado="ACTIVO")
+                          .filter(Prestamo.mora_acumulada > 0)
+                          .order_by(Prestamo.mora_acumulada.desc())
+                          .first())
+    if prestamo_con_mora:
+        prestamo_con_mora.mora_acumulada = max(
+            Decimal("0"), money(prestamo_con_mora.mora_acumulada) - monto_dec
+        )
+
     session.flush()
     return True, f"Mora de ${monto_dec:,.2f} cobrada al cliente #{cliente_id}"
 

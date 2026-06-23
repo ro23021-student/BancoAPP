@@ -1282,11 +1282,15 @@ def vista_prestamos(session):
                     alert("success" if ok else "error", ("✓ " if ok else "✗ ") + msg)
                     if ok: st.rerun()
             with col_mora:
-                if st.button("⚠️ Actualizar cuotas vencidas (mora)"):
-                    n = actualizar_cuotas_vencidas(session)
-                    session.commit()
-                    st.success(f"✅ {n} cuota(s) marcadas como VENCIDA")
-                    st.rerun()
+                with col_mora:
+                    if st.button("⚠️ Actualizar cuotas vencidas (mora)"):
+                        session.expire_all()
+                        n = actualizar_cuotas_vencidas(session)
+                        session.commit()
+                        session.expire_all()
+                        n_mora, msg_mora = calcular_mora(session)
+                        st.success(f"✅ {n} cuota(s) marcadas como VENCIDA · {msg_mora}")
+                        st.rerun()                
         else:
             alert("info", "No hay préstamos activos con saldo pendiente.")
 

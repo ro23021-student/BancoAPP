@@ -4,6 +4,7 @@ alertas.py - Sistema de alertas del banco.
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+from tiempo import hoy as _hoy
 from sqlalchemy import func, text
 from models import Cliente, Prestamo, AuditLog, ConfigBanco
 
@@ -65,7 +66,7 @@ def verificar_saldos_bajos(session):
 
 def verificar_prestamos_por_vencer(session):
     dias = int(_cfg(session, "alerta_dias_vencimiento"))
-    hoy  = datetime.now().date()
+    hoy  = _hoy()
     lim  = hoy + timedelta(days=dias)
 
     prestamos = (session.query(Prestamo)
@@ -89,7 +90,7 @@ def verificar_prestamos_por_vencer(session):
 
 
 def verificar_prestamos_vencidos(session):
-    hoy = datetime.now().date()
+    hoy = _hoy()
     prestamos = (session.query(Prestamo)
                  .filter(Prestamo.estado == "ACTIVO")
                  .filter(Prestamo.saldo_pendiente > 0)
@@ -195,7 +196,7 @@ def calcular_mora(session):
     Tabla: prestamos (con s).
     """
     tasa_mora_mensual = float(_cfg(session, "tasa_mora") or "0.02")
-    hoy = datetime.now().date()
+    hoy = _hoy()
 
     prestamos = (session.query(Prestamo)
                  .filter(Prestamo.estado == "ACTIVO")

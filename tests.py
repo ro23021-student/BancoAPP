@@ -1330,10 +1330,9 @@ class TestFlujoIntegracionCompleto:
 
         # Dar saldo suficiente y cobrar la mora
         mora_a_cobrar = float(prestamo_final.mora_acumulada)
-        cliente_final = session.query(Cliente).filter_by(id=cliente.id).first()
-        cliente_final.saldo = money(cliente_final.saldo) + money(mora_a_cobrar) + money(100)
+        depositar(session, cliente.id, mora_a_cobrar + 100)
         session.commit()
-
+        
         ok_cobro, _ = cobrar_mora_prestamo(session, cliente.id, mora_a_cobrar)
         assert ok_cobro
 

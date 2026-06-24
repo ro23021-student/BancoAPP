@@ -2481,6 +2481,7 @@ def vista_configuracion(session, usuario):
         ("alerta_intentos_login",   "Intentos login antes de alerta",  "3",       "Ej: 3",            "numero"),
         ("limite_retiro_diario",    "Límite diario de retiros ($)",    "5000.00", "0 = sin límite",   "monto"),
         ("limite_transferencia_diaria","Límite diario transferencias ($)","10000.00","0 = sin límite","monto"),
+        ("aml_umbral_monto", "Umbral AML ($)", "10000.00", "Genera alerta AML al superar este monto", "monto"),
     ]
 
     # Cargar valores actuales
@@ -3169,6 +3170,7 @@ def vista_socios(session, usuario):
                     if ok:
                         session.commit()
                         st.success(f"✅ Aporte de ${monto_a:,.2f} registrado")
+                        st.rerun()
                     else:
                         st.error(result)
 

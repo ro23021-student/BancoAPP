@@ -106,6 +106,17 @@ def crear_sucursal(session, nombre, direccion, telefono=""):
     if session.query(Sucursal).filter_by(nombre=nombre).first():
         return False, "Ya existe una sucursal con ese nombre"
 
+    sucursal = Sucursal(
+        nombre=nombre,
+        direccion=direccion,
+        telefono=telefono
+    )
+
+    session.add(sucursal)
+    session.flush()
+
+    return True, sucursal
+
 
 # ─────────────────────────────────────────────────────────────
 # BENEFICIARIOS FRECUENTES
@@ -434,12 +445,17 @@ def verificar_aml(session, cliente_id, monto, tipo_operacion=""):
     monto = money(monto)
     hoy = _hoy()
 
-    # Regla 1: monto alto
-    if monto >= UMBRAL_AML_MONTO:
+    valor_cfg = _cfg(session, "aml_umbral_monto", "10000.00")
+
+    print("AML CONFIG =", valor_cfg)
+
+    umbral_aml = Decimal(str(valor_cfg))
+
+    if monto >= umbral_aml:
         alerta = AlertaAML(
             cliente_id=cliente_id,
             tipo="MONTO_ALTO",
-            descripcion=f"{tipo_operacion}: monto ${float(monto):,.2f} supera el umbral de ${float(UMBRAL_AML_MONTO):,.2f}",
+            descripcion=f"{tipo_operacion}: monto ${float(monto):,.2f} supera el umbral de ${float(umbral_aml):,.2f}",
             monto=monto,
             nivel="CRITICA",
         )

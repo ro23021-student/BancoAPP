@@ -84,9 +84,18 @@ from operaciones import tasa_deposito, tasa_transferencia, tasa_prestamo
 @st.cache_resource
 def get_engine():
     db_url = st.secrets.get("DATABASE_URL", "sqlite:///banco.db")
-    connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
-    engine = create_engine(db_url, connect_args=connect_args, pool_pre_ping=True, pool_size=5, max_overflow=10)
-    engine = create_engine(db_url, connect_args=connect_args)
+    if db_url.startswith("sqlite"):
+        connect_args = {"check_same_thread": False}
+        engine = create_engine(db_url, connect_args=connect_args)
+    else:
+        # PostgreSQL / Supabase
+        engine = create_engine(
+            db_url,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=10,
+            connect_args={"options": "-c search_path=public"},
+        )
     BaseLocal.metadata.create_all(engine)
     return engine
 

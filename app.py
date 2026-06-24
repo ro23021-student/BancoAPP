@@ -3247,14 +3247,37 @@ def vista_contabilidad_avanzada(session, usuario):
         with col3:
             cli_opts = {f"{c.nombre} (#{c.id})": c.id for c in clientes}
             cli_sel = st.selectbox("Cliente", list(cli_opts.keys()), key="mora_cli")
+            # Mostrar mora total del cliente seleccionado
+            cli_id_sel = cli_opts[cli_sel]
+            prestamos_mora = (session.query(Prestamo)
+                              .filter(Prestamo.cliente_id == cli_id_sel)
+                              .filter(Prestamo.estado.in_(["ACTIVO", "MOROSO"]))
+                              .filter(Prestamo.mora_acumulada > 0)
+                              .all())
+            mora_total_cli = sum(float(p.mora_acumulada) for p in prestamos_mora)
+            if mora_total_cli > 0:
+                st.caption(f"Mora total acumulada: **${mora_total_cli:,.2f}** ({len(prestamos_mora)} prestamo(s))")
+                for pm in prestamos_mora:
+                    st.caption(f"  Prestamo #{pm.id}: ${float(pm.mora_acumulada):,.2f}")
+            else:
+                st.caption("Este cliente no tiene mora acumulada")
         with col4:
-            mora_monto = st.number_input("Monto mora ($)", min_value=1.0, value=10.0, step=5.0, key="mora_monto")
-        if st.button("💰 Cobrar Mora", key="btn_mora_cobrar"):
+            mora_monto = st.number_input(
+                "Monto mora ($)",
+                min_value=0.01,
+                max_value=float(mora_total_cli) if mora_total_cli > 0 else 0.01,
+                value=min(10.0, float(mora_total_cli)) if mora_total_cli > 0 else 0.01,
+                step=5.0,
+                key="mora_monto"
+            )
+        if st.button("💰 Cobrar Mora", key="btn_mora_cobrar", disabled=(mora_total_cli == 0)):
             try:
                 ok, msg = cobrar_mora_prestamo(session, cli_opts[cli_sel], mora_monto)
                 session.commit()
                 alert("success" if ok else "error", msg)
                 _audit("MORA_COBRAR", msg, "OK" if ok else "ERROR")
+                if ok:
+                    st.rerun()
             except Exception as e:
                 session.rollback(); alert("error", str(e))
 

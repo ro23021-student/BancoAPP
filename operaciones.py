@@ -1495,36 +1495,65 @@ def cobrar_mora_prestamo(session, cliente_id: int, monto: float):
     Se descuenta del saldo del cliente y se registra como ingreso.
       Débito  Depositos Clientes   monto
       Crédito Ingresos por Mora    monto
+
+    Distribuye el cobro entre TODOS los préstamos con mora del cliente
+    (ordenados por mora descendente), no solo el de mayor mora.
+    Valida que el monto no exceda la mora total acumulada real.
+    Resetea dias_mora a 0 cuando mora_acumulada llega a 0.
     """
     monto_dec = money(monto)
     if monto_dec <= 0:
         return False, "El monto debe ser positivo"
+
     cliente = _get_cliente(session, cliente_id)
     if not cliente:
         return False, "Cliente no encontrado"
+
+    # Obtener TODOS los préstamos con mora del cliente (ACTIVO y MOROSO)
+    prestamos_con_mora = (session.query(Prestamo)
+                          .filter(Prestamo.cliente_id == cliente_id)
+                          .filter(Prestamo.estado.in_(["ACTIVO", "MOROSO"]))
+                          .filter(Prestamo.mora_acumulada > 0)
+                          .order_by(Prestamo.mora_acumulada.desc())
+                          .all())
+
+    # FIX Bug 4: validar que monto no exceda mora total real
+    mora_total = sum(money(p.mora_acumulada) for p in prestamos_con_mora)
+    if mora_total == 0:
+        return False, "Este cliente no tiene mora acumulada en ningún préstamo"
+    if monto_dec > mora_total:
+        return False, (f"El monto ${monto_dec:,.2f} excede la mora total acumulada "
+                       f"${mora_total:,.2f}. Ingrese un monto menor o igual.")
+
+    # FIX Bug 1: validar saldo del cliente
     if money(cliente.saldo) < monto_dec:
         return False, f"Saldo insuficiente para cobrar mora (saldo: ${cliente.saldo:,.2f})"
+
+    # Descontar del saldo del cliente y registrar contablemente
     _set_saldo(session, cliente_id, money(cliente.saldo) - monto_dec)
     registrar(session,
               debitos=[("Depositos Clientes", monto_dec)],
               creditos=[("Ingresos por Mora", monto_dec)],
               descripcion=f"Cobro mora cliente #{cliente_id}")
-    _mov(session, cliente_id, "Mora Cobrada", monto_dec, f"Intereses de mora ${monto_dec:,.2f}")
+    _mov(session, cliente_id, "Mora Cobrada", monto_dec,
+         f"Intereses de mora ${monto_dec:,.2f} ({len(prestamos_con_mora)} préstamo(s))")
 
-    # Reducir mora_acumulada del préstamo activo con mora de este cliente,
-    # para que la pantalla de Mora y Provisiones refleje el cobro.
-    prestamo_con_mora = (session.query(Prestamo)
-                          .filter_by(cliente_id=cliente_id, estado="ACTIVO")
-                          .filter(Prestamo.mora_acumulada > 0)
-                          .order_by(Prestamo.mora_acumulada.desc())
-                          .first())
-    if prestamo_con_mora:
-        prestamo_con_mora.mora_acumulada = max(
-            Decimal("0"), money(prestamo_con_mora.mora_acumulada) - monto_dec
-        )
+    # FIX Bug 1: distribuir el cobro entre TODOS los préstamos con mora,
+    # de mayor a menor, hasta agotar el monto cobrado.
+    restante = monto_dec
+    for p in prestamos_con_mora:
+        if restante <= 0:
+            break
+        mora_p = money(p.mora_acumulada)
+        aplicar = min(mora_p, restante)
+        p.mora_acumulada = mora_p - aplicar
+        restante -= aplicar
+        # FIX Bug 2: resetear dias_mora cuando mora llega a 0
+        if p.mora_acumulada == Decimal("0"):
+            p.dias_mora = 0
 
     session.flush()
-    return True, f"Mora de ${monto_dec:,.2f} cobrada al cliente #{cliente_id}"
+    return True, f"Mora de ${monto_dec:,.2f} cobrada al cliente #{cliente_id} (mora total era ${mora_total:,.2f})"
 
 
 # ── GASTOS OPERATIVOS (salarios, alquiler, servicios) ──────────────

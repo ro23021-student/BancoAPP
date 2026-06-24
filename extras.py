@@ -93,12 +93,18 @@ def inicializar_sucursales(session):
 
 
 def crear_sucursal(session, nombre, direccion, telefono=""):
+
+    if not nombre.strip():
+        return False, "Debe ingresar el nombre"
+
+    if not direccion.strip():
+        return False, "Debe ingresar la dirección"
+
+    if not telefono.strip():
+        return False, "Debe ingresar el teléfono"
+
     if session.query(Sucursal).filter_by(nombre=nombre).first():
         return False, "Ya existe una sucursal con ese nombre"
-    s = Sucursal(nombre=nombre, direccion=direccion, telefono=telefono)
-    session.add(s)
-    session.flush()
-    return True, s
 
 
 # ─────────────────────────────────────────────────────────────

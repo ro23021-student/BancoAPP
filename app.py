@@ -15,7 +15,7 @@ import plotly.express as px
 from datetime import datetime
 from sqlalchemy import create_engine, func
 from sqlalchemy.orm import Session, selectinload
-from contabilidad import registrar
+from contabilidad import money, registrar
 
 from models import (
     BaseLocal, Cliente, Movimiento, Prestamo,
@@ -1924,24 +1924,53 @@ def ejecutar_stress_test(session):
     if prest_mor:
         ok_mor, _ = clasificar_prestamo_moroso(session, prest_mor.id)
         check("F3", "Clasificar préstamo como moroso", ok_mor)
-        try: session.commit()
-        except: session.rollback()
-        # Castigar como incobrable
-        prest_mor2 = (session.query(_Prest)
-                      .filter(_Prest.cliente_id.in_([c.id for c in clientes_temp]),
-                              _Prest.estado == "MOROSO")
-                      .first())
+
+        try:
+            session.commit()
+        except:
+            session.rollback()
+
+        # Generar una mora para el préstamo que acabamos de volver moroso
+        prest_mor = session.query(_Prest).filter_by(id=prest_mor.id).first()
+        prest_mor.mora_acumulada = money(50)
+        prest_mor.dias_mora = 30
+        session.commit()
+
+        # Cobrar mora al dueño REAL del préstamo
+        ok_mora_c, msg_mora = cobrar_mora_prestamo(
+        session,
+        prest_mor.cliente_id,
+        25
+        )
+
+        check("F3", "Cobrar mora préstamo", ok_mora_c, msg_mora)
+
+        try:
+            session.commit()
+        except:
+            session.rollback()
+
+        prest_mor2 = (
+            session.query(_Prest)
+            .filter(
+                _Prest.cliente_id.in_([c.id for c in clientes_temp]),
+                _Prest.estado == "MOROSO"
+            )
+            .first()
+        )
+
         if prest_mor2:
             ok_cast, _ = castigar_prestamo_incobrable(session, prest_mor2.id)
             check("F3", "Castigar préstamo incobrable", ok_cast)
-            try: session.commit()
-            except: session.rollback()
+
+            try:
+                session.commit()
+            except:
+                session.rollback()
     else:
         check("F3", "Clasificar/castigar moroso", False, "No había préstamo activo disponible")
 
-    # Mora
-    ok_mora_c, _ = cobrar_mora_prestamo(session, c2.id, 25)
-    check("F3", "Cobrar mora préstamo", ok_mora_c)
+    
     ok_mora_b, _ = registrar_mora_pagada_banco(session, 10, "Mora ST")
     check("F3", "Registrar mora pagada banco", ok_mora_b)
     try: session.commit()
@@ -2815,15 +2844,27 @@ def vista_tarjetas(session, usuario):
         clientes = session.query(Cliente).filter(Cliente.estado == "ACTIVO").order_by(Cliente.nombre).all()
         if tiene_permiso(usuario, "gestionar_tarjetas"):
             with st.expander("➕ Emitir Tarjeta de Débito"):
-                c_sel = st.selectbox("Cliente", clientes, format_func=lambda c: f"{c.nombre} ({c.num_cuenta})", key="td_cliente")
-                if st.button("Emitir", key="btn_td"):
-                    ok, result = emitir_tarjeta_debito(session, c_sel.id)
-                    if ok:
-                        session.commit()
-                        st.success(f"✅ Tarjeta emitida: {result.numero[:4]}...{result.numero[-4:]}")
-                    else:
-                        st.error(result)
+                if not clientes:
+                    st.warning("No existen clientes activos registrados.")
+                else:
+                    c_sel = st.selectbox(
+                        "Cliente",
+                        clientes,
+                        format_func=lambda c: f"{c.nombre} ({c.num_cuenta})",
+                        key="td_cliente"
+                    )
 
+                    if st.button("Emitir", key="btn_td"):
+                        ok, result = emitir_tarjeta_debito(session, c_sel.id)
+
+                        if ok:
+                            session.commit()
+                            st.success(
+                                f"✅ Tarjeta emitida: {result.numero[:4]}...{result.numero[-4:]}"
+                            )
+                        else:
+                            st.error(result)
+                    
         tarjetas = session.query(TarjetaDebito).all()
         if tarjetas:
             data = []
@@ -2840,16 +2881,37 @@ def vista_tarjetas(session, usuario):
         st.subheader("Tarjetas de Crédito")
         if tiene_permiso(usuario, "gestionar_tarjetas"):
             with st.expander("➕ Emitir Tarjeta de Crédito"):
-                c_sel2 = st.selectbox("Cliente", clientes, format_func=lambda c: f"{c.nombre} (Score: {c.score_credito})", key="tc_cliente")
-                limite = st.number_input("Límite de crédito ($)", min_value=100.0, value=500.0, step=100.0)
-                if st.button("Emitir", key="btn_tc"):
-                    ok, result = emitir_tarjeta_credito(session, c_sel2.id, limite)
-                    if ok:
-                        session.commit()
-                        st.success(f"✅ Tarjeta crédito emitida: {result.numero[:4]}...{result.numero[-4:]} | Límite: ${float(result.limite):,.2f}")
-                    else:
-                        st.error(result)
+                if not clientes:
+                    st.warning("No existen clientes activos registrados.")
+                else:
+                    c_sel2 = st.selectbox(
+                        "Cliente",
+                        clientes,
+                        format_func=lambda c: f"{c.nombre} (Score: {c.score_credito})",
+                        key="tc_cliente"
+                    )
+                    limite = st.number_input(
+                        "Límite de crédito ($)",
+                        min_value=100.0,
+                        value=500.0,
+                        step=100.0
+                    )
+                    if st.button("Emitir", key="btn_tc"):
+                        ok, result = emitir_tarjeta_credito(
+                            session,
+                            c_sel2.id,
+                            limite
+                        )
 
+                        if ok:
+                            session.commit()
+                            st.success(
+                                f"✅ Tarjeta crédito emitida: "
+                                f"{result.numero[:4]}...{result.numero[-4:]} "
+                                f"| Límite: ${float(result.limite):,.2f}"
+                            )
+                        else:
+                            st.error(result)
             with st.expander("💳 Registrar Consumo (Manual)"):
                 tarjetas_activas = session.query(TarjetaCredito).filter_by(estado="ACTIVA").all()
                 if tarjetas_activas:
@@ -3254,22 +3316,34 @@ def vista_contabilidad_avanzada(session, usuario):
         clientes = session.query(Cli).filter(Cli.estado == "ACTIVO").all()
         col3, col4 = st.columns(2)
         with col3:
-            cli_opts = {f"{c.nombre} (#{c.id})": c.id for c in clientes}
-            cli_sel = st.selectbox("Cliente", list(cli_opts.keys()), key="mora_cli")
-            # Mostrar mora total del cliente seleccionado
-            cli_id_sel = cli_opts[cli_sel]
-            prestamos_mora = (session.query(Prestamo)
+            if not clientes:
+                st.warning("No existen clientes activos.")
+                mora_total_cli = 0
+            else:
+                cli_opts = {
+                    f"{c.nombre} (#{c.id})": c.id
+                    for c in clientes
+                }
+
+                cli_sel = st.selectbox(
+                    "Cliente",
+                    list(cli_opts.keys()),
+                    key="mora_cli"
+                )
+
+                cli_id_sel = cli_opts[cli_sel]
+                prestamos_mora = (session.query(Prestamo)
                               .filter(Prestamo.cliente_id == cli_id_sel)
                               .filter(Prestamo.estado.in_(["ACTIVO", "MOROSO"]))
                               .filter(Prestamo.mora_acumulada > 0)
                               .all())
-            mora_total_cli = sum(float(p.mora_acumulada) for p in prestamos_mora)
-            if mora_total_cli > 0:
-                st.caption(f"Mora total acumulada: **${mora_total_cli:,.2f}** ({len(prestamos_mora)} prestamo(s))")
-                for pm in prestamos_mora:
-                    st.caption(f"  Prestamo #{pm.id}: ${float(pm.mora_acumulada):,.2f}")
-            else:
-                st.caption("Este cliente no tiene mora acumulada")
+                mora_total_cli = sum(float(p.mora_acumulada) for p in prestamos_mora)
+                if mora_total_cli > 0:
+                    st.caption(f"Mora total acumulada: **${mora_total_cli:,.2f}** ({len(prestamos_mora)} prestamo(s))")
+                    for pm in prestamos_mora:
+                        st.caption(f"  Prestamo #{pm.id}: ${float(pm.mora_acumulada):,.2f}")
+                else:
+                    st.caption("Este cliente no tiene mora acumulada")
         with col4:
             mora_monto = st.number_input(
                 "Monto mora ($)",
@@ -3279,7 +3353,7 @@ def vista_contabilidad_avanzada(session, usuario):
                 step=5.0,
                 key="mora_monto"
             )
-        if st.button("💰 Cobrar Mora", key="btn_mora_cobrar", disabled=(mora_total_cli == 0)):
+        if clientes and st.button("💰 Cobrar Mora", key="btn_mora_cobrar", disabled=(mora_total_cli == 0)):
             try:
                 ok, msg = cobrar_mora_prestamo(session, cli_opts[cli_sel], mora_monto)
                 session.commit()
@@ -3672,13 +3746,16 @@ def vista_dashboard_gerencial(session):
     if not cierre_hoy:
         notas_c = st.text_input("Notas del cierre", key="notas_cierre")
         if st.button("🔒 Realizar Cierre del Día", type="primary"):
-            ok, result = realizar_cierre_diario(session, "Gerente", notas_c)
-            if ok:
-                session.commit()
-                st.success(f"✅ Cierre realizado — Depósitos: ${float(result.total_depositos):,.2f} | Retiros: ${float(result.total_retiros):,.2f}")
-                st.rerun()
+            if not notas_c.strip():
+                st.error("Debe escribir una nota para realizar el cierre.")
             else:
-                st.error(result)
+                ok, result = realizar_cierre_diario(session, "Gerente", notas_c)
+                if ok:
+                    session.commit()
+                    st.success(f"✅ Cierre realizado — Depósitos: ${float(result.total_depositos):,.2f} | Retiros: ${float(result.total_retiros):,.2f}")
+                    st.rerun()
+                else:
+                    st.error(result)
     else:
         st.success(f"✅ Cierre de hoy ya realizado — Caja: ${float(cierre_hoy.caja_final):,.2f}")
 
